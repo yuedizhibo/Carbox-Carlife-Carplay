@@ -28,6 +28,10 @@
 *.status
 *.core
 
+# Python bytecode caches
+__pycache__/
+*.pyc
+
 # Media captures and firmware/image artifacts
 *.img
 *.raw
