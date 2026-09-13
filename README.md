@@ -1,5 +1,14 @@
 # Zero2W 车载互联桥接固件
 
+> [!IMPORTANT]
+> **本项目处于初期阶段，尚不具备可运行能力。** 接口层与协议链路已经实现并有本地测试覆盖，但真实车机后端与手机端到端通路尚未接通，请不要用于实车、量产或生产环境。
+>
+> **This project is in an early stage and is NOT runnable yet.** Interface layers and protocol paths exist and are covered by local tests, but the real head-unit backend and end-to-end phone connectivity are not in place. Do not use it on a real vehicle, in production, or in any safety-relevant setup.
+
+**中文** | [English](#english)
+
+## 简介
+
 香橙派 Zero2W（Allwinner H618）上的车载互联桥接软件：接收手机侧的无线 CarPlay、无线 CarLife+ 输入，经 Core 统一调度后直通或转换为原车可识别的有线 CarPlay 输出。
 
 ## 功能
@@ -58,6 +67,75 @@ ctest --test-dir build --output-on-failure
 ```
 
 CarLife+ 输入依赖 SDL2/FFmpeg，默认不参与构建：
+
+```bash
+cmake -S . -B build -DBUILD_WIRELESS_CARLIFE_PLUS=ON
+```
+
+---
+
+## English
+
+### Overview
+
+In-vehicle connectivity bridge for the Orange Pi Zero 2W (Allwinner H618). It accepts wireless CarPlay and wireless CarLife+ from the phone, schedules both through a common Core, and then forwards or converts them into wired CarPlay that a head unit can recognise.
+
+### Features
+
+#### Wireless CarPlay input
+- CPMF (CarPlay Media Protocol) media and control IPC: main/auxiliary screen H.264, PCM audio, stream lifecycle and 9 classes of head-unit control events.
+- Extended message interface: media metadata, artwork, lyrics, navigation, vehicle data, telephony, contacts, call log, ducking, safe area, day/night, frame rate, file transfer, activation, content encryption, multi-session, assistive touch, VoiceOver, HID mode, proximity and capability reporting.
+- Native MFi Auth 3.0 tool: certificate length, random challenge and response retrieval; the bus identity is verified before any access and the I²C bus carrying the on-board Ethernet PHY is refused unconditionally.
+- Rust sidecar: CarPlay access-point configuration and supervision, MFi safety policy, USB debug-link protection, preflight diagnostics and a bounded JSON control socket.
+
+#### Wireless CarLife+ head unit
+- Bluetooth discovery and bootstrap: HFP vehicle identification, four-step handshake over SPP and IP exchange.
+- Seven TCP channels: session negotiation, four-step authentication, 19 capability items, video/audio/touch/hard-key channels and heartbeat timeouts.
+- Media: H.264 Annex-B decode and display (1920x1080@30 by default), PCM playback and frame snapshots.
+- Control: single-point touch and hard keys sent back to the phone, multi-touch format chosen from the negotiated capabilities.
+- Topologies: head-unit hotspot (hostapd + dnsmasq), UDP 7999 discovery, adb port forwarding and local listening mode.
+
+#### Scheduling (Core)
+- With no input, an administration desktop is shown and status, test and configuration functions remain available.
+- A single wireless CarPlay source takes the forwarding path; a single CarLife+ source takes the conversion path.
+- With several inputs, the desktop lets the user choose; up to 8 inputs can be registered.
+- When an input disconnects or fails, stale media state is cleared so frames from the previous session cannot leak into the next one.
+- Every queue and buffer is bounded, which suits a 1 GB device.
+
+#### Output
+- Forwarding: raw H.264 and PCM byte forwarding without decode, resample or channel change; sessions and streams are driven by SETUP/RECORD/TEARDOWN receipts; phone commands and head-unit controls are forwarded in both directions with real execution results; vehicle microphone and head-unit display/HID information are kept for input-side negotiation.
+- Wired CarPlay output interface (WiredCarPlay): a C++20 interface layer with a session state machine, asynchronous requests and execution receipts, capability checks, bounded bidirectional media and microphone queues, structured media metadata, 13 control commands and 59 iAP2 CSM message IDs.
+
+#### Web interface
+Status and telemetry, media preview, display configuration, touch and test endpoints, with strict form parsing and rejection of invalid input for 9 classes of control commands.
+
+#### Firmware
+Customised Linux kernel and device tree, boot without initrd, a driver set trimmed to the on-board devices, USB serial/network debug links, and Wi-Fi/Bluetooth configuration.
+
+### Modules
+
+| Directory | Function |
+| --- | --- |
+| `Input/WirelessCarPlay` | Wireless CarPlay input, MFi Auth 3.0 tool, Rust sidecar |
+| `Input/WirelessCarLifePlus` | Wireless CarLife+ head unit |
+| `Core/MainMenu` | Input registration, automatic/manual selection, desktop scheduling |
+| `Core/Forward` | Forwarding from wireless CarPlay to the wired output |
+| `Core/Convert` | Bounded media recording and protocol conversion data path |
+| `Core/Web` | Web administration, desktop, test and media endpoints |
+| `Output/WiredCarPlay` | Wired CarPlay output interface |
+| `Linux` | Lightweight Linux firmware, kernel configuration and build scripts |
+
+Data flow, scheduling rules and per-module completeness are described in [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md); interface listings live in the README/API documents inside each module.
+
+### Build and test
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+```
+
+The CarLife+ input needs SDL2/FFmpeg and is not part of the default build:
 
 ```bash
 cmake -S . -B build -DBUILD_WIRELESS_CARLIFE_PLUS=ON
