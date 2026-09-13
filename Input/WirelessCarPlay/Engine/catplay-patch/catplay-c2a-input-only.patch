@@ -1,0 +1,3404 @@
+--- a/c2a/catplay_c2a/src/config.rs
++++ b/c2a/catplay_c2a/src/config.rs
+@@ -1,4 +1,11 @@
+ use serde::Deserialize;
++
++/// The only MFi device that this local Zero2W evaluation may access.
++///
++/// Validation is intentionally independent of the mode: bridge mode must not
++/// gain a route around the AC200 protection that input-only mode uses.
++pub const ZERO2W_MFI_BUS_OFFSET: u32 = 1;
++pub const ZERO2W_MFI_DEVICE_ADDRESS: u8 = 0x10;
+ 
+ #[derive(Debug, Deserialize, Default, Clone)]
+ pub struct AppConfig {
+@@ -42,6 +49,38 @@
+     pub timeout_ms: u64,
+ }
+ 
++/// Reject every MFi shape except the physical Auth 3.0 coprocessor on
++/// `/dev/i2c-1` at `0x10`.
++///
++/// This pure guard must run before *any* gadget, MFi, or I2C side effect. It
++/// deliberately rejects an inactive server stanza too: accepting it would make
++/// a later configuration change an implicit bypass of the board allowlist.
++pub fn validate_zero2w_mfi_config(config: &AppConfig) -> Result<(), String> {
++    if config.mfi.client.is_some() {
++        return Err("MFi remote/client backends are forbidden; only /dev/i2c-1@0x10 is allowed".into());
++    }
++    if config.mfi.server.is_some() {
++        return Err("MFi server backends are forbidden; only /dev/i2c-1@0x10 is allowed".into());
++    }
++
++    let Some(i2c) = config.mfi.i2c.as_ref() else {
++        return Err("MFi I2C backend is required at /dev/i2c-1@0x10".into());
++    };
++    if i2c.bus_offset != ZERO2W_MFI_BUS_OFFSET {
++        return Err(format!(
++            "MFi bus {} is forbidden; only bus {} is allowed",
++            i2c.bus_offset, ZERO2W_MFI_BUS_OFFSET
++        ));
++    }
++    if i2c.dev_addr != ZERO2W_MFI_DEVICE_ADDRESS {
++        return Err(format!(
++            "MFi address 0x{:02x} is forbidden; only 0x{:02x} is allowed",
++            i2c.dev_addr, ZERO2W_MFI_DEVICE_ADDRESS
++        ));
++    }
++    Ok(())
++}
++
+ // Bluetooth start
+ 
+ #[derive(Debug, Deserialize, Default, Clone)]
+@@ -76,3 +115,52 @@
+     pub udc_car: Option<String>,
+     pub udc_extra: Option<String>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn allowed() -> AppConfig {
++        AppConfig {
++            mfi: MfiConfig {
++                i2c: Some(MfiConfigI2C {
++                    bus_offset: ZERO2W_MFI_BUS_OFFSET,
++                    dev_addr: ZERO2W_MFI_DEVICE_ADDRESS,
++                    timeout_ms: 100,
++                }),
++                ..MfiConfig::default()
++            },
++            ..AppConfig::default()
++        }
++    }
++
++    #[test]
++    fn only_the_board_mfi_i2c_backend_is_allowed() {
++        assert!(validate_zero2w_mfi_config(&allowed()).is_ok());
++
++        let mut remote = allowed();
++        remote.mfi.client = Some(MfiConfigClient {
++            remote: "127.0.0.1:1234".into(),
++        });
++        assert!(validate_zero2w_mfi_config(&remote).unwrap_err().contains("remote/client"));
++
++        let mut server = allowed();
++        server.mfi.server = Some(MfiConfigServer {
++            enabled: false,
++            bind: "127.0.0.1:1234".into(),
++        });
++        assert!(validate_zero2w_mfi_config(&server).unwrap_err().contains("server"));
++
++        let mut missing = allowed();
++        missing.mfi.i2c = None;
++        assert!(validate_zero2w_mfi_config(&missing).unwrap_err().contains("required"));
++
++        let mut ac200 = allowed();
++        ac200.mfi.i2c.as_mut().unwrap().bus_offset = 2;
++        assert!(validate_zero2w_mfi_config(&ac200).unwrap_err().contains("bus 2"));
++
++        let mut wrong_address = allowed();
++        wrong_address.mfi.i2c.as_mut().unwrap().dev_addr = 0x11;
++        assert!(validate_zero2w_mfi_config(&wrong_address).unwrap_err().contains("0x11"));
++    }
++}
+--- a/c2a/catplay_c2a/src/mfi_manager.rs
++++ b/c2a/catplay_c2a/src/mfi_manager.rs
+@@ -1,13 +1,10 @@
+-use std::{error::Error, sync::Arc, thread::spawn};
++use std::{error::Error, sync::Arc};
+ 
+-use catplay_mfi::{
+-    MfiDeficeRef, MfiDevice, MfiDeviceI2C,
+-    server::{MfiDeviceRemoteClient, MfiDeviceServer},
+-};
++use catplay_mfi::{MfiDeficeRef, MfiDevice, MfiDeviceI2C};
+ use log::info;
+ use uuid::Uuid;
+ 
+-use crate::AppConfig;
++use crate::{AppConfig, validate_zero2w_mfi_config};
+ 
+ pub struct MfiManager {
+     device: Option<Arc<dyn MfiDevice>>,
+@@ -24,42 +21,33 @@
+     }
+ 
+     pub fn get_device(&self) -> Arc<dyn MfiDevice> {
+-        self.device.as_ref().unwrap().clone()
++        self.device.as_ref().expect("MFi device requested before start").clone()
+     }
+ 
++    /// Starts only the pinned physical MFi Auth device.
++    ///
++    /// Keep this guard here as well as in `Main::start`: callers that bypass the
++    /// top-level mode dispatcher must still be unable to open the AC200 bus or a
++    /// remote/server backend.
+     pub fn start(&mut self, config: &AppConfig) -> Result<(), Box<dyn Error>> {
+-        let mfi: MfiDeficeRef = if let Some(mfi_client) = &config.mfi.client {
+-            Arc::new(MfiDeviceRemoteClient::new(mfi_client.remote.clone())?)
+-        } else if let Some(mfi_i2c) = &config.mfi.i2c {
+-            Arc::new(MfiDeviceI2C::new(
+-                mfi_i2c.bus_offset,
+-                mfi_i2c.dev_addr, /*, Duration::from_millis(mfi_i2c.timeout_ms)*/
+-            )?)
+-        } else {
+-            return Err("mfi backend not defined".into());
+-        };
++        validate_zero2w_mfi_config(config).map_err(std::io::Error::other)?;
++        let i2c = config.mfi.i2c.as_ref().expect("validated MFi I2C configuration");
++        let mfi: MfiDeficeRef = Arc::new(MfiDeviceI2C::new(i2c.bus_offset, i2c.dev_addr)?);
+ 
+         if config.mfi.selftest {
+             info!("Performing MFi self-test");
+             let mfi_cert: Vec<u8> = mfi.read_certificate()?;
+             let uuid = self.cert_hash(&mfi)?;
+-
+             info!("MFI booted cert size = {} hash = {}", mfi_cert.len(), uuid);
+         }
+ 
+-        self.device.replace(mfi.clone());
+-
+-        if let Some(mfi_server) = &config.mfi.server
+-            && mfi_server.enabled
+-        {
+-            info!("Starting MFI server on {}", mfi_server.bind.clone());
+-
+-            let mut server = MfiDeviceServer::new(mfi_server.bind.clone(), mfi.clone());
+-            server.bind().map_err(|err| format!("failed to bind mfi server: {}", err))?;
+-            spawn(move || server.listen());
+-            info!("MFI server is now running in background")
+-        }
+-
++        self.device.replace(mfi);
+         Ok(())
+     }
+ }
++
++impl Default for MfiManager {
++    fn default() -> Self {
++        Self::new()
++    }
++}
+--- a/c2a/catplay_c2a/src/lib.rs
++++ b/c2a/catplay_c2a/src/lib.rs
+@@ -2,13 +2,16 @@
+ 
+ mod config;
+ mod cp_output_manager;
++mod display_config;
+ mod homekit_manager;
++mod input_only;
+ mod main_init;
++mod media_ipc;
+ mod mfi_manager;
++mod preview_rx;
+ mod prod_gadget;
+ pub mod proxy;
+ mod telemetry;
+-mod media_ipc;
+ mod ui;
+ 
+ pub mod audiov2;
+@@ -16,10 +19,12 @@
+ pub use config::*;
+ pub use cp_output_manager::*;
+ pub use homekit_manager::*;
++pub use input_only::*;
+ pub use main_init::*;
++pub use media_ipc::{MediaServer, MediaTap, VideoRole};
+ pub use mfi_manager::*;
++pub use preview_rx::*;
+ pub use prod_gadget::*;
+ pub use telemetry::*;
+-pub use media_ipc::{MediaServer, MediaTap};
+ 
+ pub mod proxy_rpc;
+--- a/c2a/catplay_c2a/src/main.rs
++++ b/c2a/catplay_c2a/src/main.rs
+@@ -2,21 +2,43 @@
+ 
+ use std::process::exit;
+ 
++use catplay_c2a::{Main, RunMode};
++
+ // This reports support only. Live readiness is published by the engine-owned
+-// CP_TELEMETRY_SOCKET listener after the normal reconciler has observed it.
++// CP_TELEMETRY_SOCKET listener after the selected reconciler has observed it.
++fn capabilities_json(socket: &str) -> String {
++    format!(
++        "{{\"schema_version\":1,\"engine\":\"catplay\",\"listener_ready\":false,\"wireless_input\":true,\"wired_output\":true,\"input_only\":true,\"telemetry_socket\":{}}}",
++        serde_json::to_string(socket).expect("socket path must serialize"),
++    )
++}
++
+ fn cp_native_capabilities() -> Option<i32> {
+     if !std::env::args().any(|arg| arg == "--cp-capabilities-json") {
+         return None;
+     }
+     let socket = std::env::var("CP_TELEMETRY_SOCKET").unwrap_or_else(|_| "/run/zero2w/catplay.sock".into());
+-    println!(
+-        "{{\"schema_version\":1,\"engine\":\"catplay\",\"listener_ready\":false,\"wireless_input\":true,\"wired_output\":true,\"telemetry_socket\":{}}}",
+-        serde_json::to_string(&socket).expect("socket path must serialize"),
+-    );
++    println!("{}", capabilities_json(&socket));
+     Some(0)
+ }
+ 
+-use catplay_c2a::Main;
++fn run_mode_from_args(args: impl IntoIterator<Item = String>) -> Result<RunMode, String> {
++    let mut input_only = false;
++    let mut bridge = false;
++    for arg in args {
++        match arg.as_str() {
++            "--cp-input-only" => input_only = true,
++            "--cp-bridge" => bridge = true,
++            _ => {}
++        }
++    }
++    match (input_only, bridge) {
++        (true, true) => Err("--cp-input-only and --cp-bridge are mutually exclusive".into()),
++        (true, false) => Ok(RunMode::InputOnly),
++        (false, _) => Ok(RunMode::Bridge),
++    }
++}
++
+ use catplay_tracing::logger::{AsyncLogger, setup_prod_logger};
+ use catplay_tracing::tracer::SessionTracer;
+ use log::{error, info, warn};
+@@ -57,6 +79,13 @@
+     if let Some(code) = cp_native_capabilities() {
+         exit(code);
+     }
++    let mode = match run_mode_from_args(std::env::args().skip(1)) {
++        Ok(mode) => mode,
++        Err(err) => {
++            eprintln!("catplay_c2a: {err}");
++            exit(2);
++        }
++    };
+ 
+     #[cfg(feature = "jemalloc")]
+     disable_jemalloc_thread_cache();
+@@ -72,7 +101,7 @@
+ 
+     info!("Calling start()");
+ 
+-    let mut main = Main::start().await;
++    let mut main = Main::start(mode).await;
+     match main {
+         Err(err) => {
+             error!("Failed to start: {}", err);
+@@ -89,3 +118,25 @@
+     drop(b);
+     exit(1);
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn input_only_cli_is_explicit_and_bridge_is_mutually_exclusive() {
++        assert_eq!(run_mode_from_args(["--cp-input-only".into()]).unwrap(), RunMode::InputOnly);
++        assert_eq!(run_mode_from_args(["--cp-bridge".into()]).unwrap(), RunMode::Bridge);
++        assert_eq!(run_mode_from_args(Vec::<String>::new()).unwrap(), RunMode::Bridge);
++        assert!(run_mode_from_args(["--cp-input-only".into(), "--cp-bridge".into()]).is_err());
++    }
++
++    #[test]
++    fn capability_json_declares_input_only_support() {
++        let value: serde_json::Value = serde_json::from_str(&capabilities_json("/tmp/catplay.sock")).unwrap();
++        assert_eq!(value["schema_version"], 1);
++        assert_eq!(value["engine"], "catplay");
++        assert_eq!(value["input_only"], true);
++        assert_eq!(value["telemetry_socket"], "/tmp/catplay.sock");
++    }
++}
+--- a/c2a/catplay_c2a/src/main_init.rs
++++ b/c2a/catplay_c2a/src/main_init.rs
+@@ -1,84 +1,243 @@
+ use std::{error::Error, fs, time::Duration};
+ 
+-use crate::{AppConfig, CarPlayOutputManager, HomeKitManager, MediaServer, MediaTap, MfiManager, TelemetryServer};
++use crate::{
++    AppConfig, CarPlayOutputManager, HomeKitManager, InputOnlyManager, MediaServer, MediaTap, MfiManager, TelemetryServer,
++    TelemetrySnapshot, validate_zero2w_mfi_config,
++};
+ use catplay_iap2_usb_gadget::gadget::GadgetHelper;
+ use catplay_util::{EventReconciler, EventSleeper};
+ use log::error;
+-use tokio::{signal, time::{interval, MissedTickBehavior}};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RunMode {
++    Bridge,
++    InputOnly,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum StartupEffect {
++    GadgetCleanup,
++    MfiStart,
++    HomeKitStart,
++    MediaServer,
++    OutputManager,
++    TxPath,
++    WirelessPreview,
++}
++
++trait StartupHook {
++    fn observe(&mut self, effect: StartupEffect);
++}
++
++struct NoopStartupHook;
++
++impl StartupHook for NoopStartupHook {
++    fn observe(&mut self, _effect: StartupEffect) {}
++}
++
++/// A side-effect-free plan. Building it is the central MFi guard for both
++/// modes, and it happens before Main reaches GadgetHelper, MfiManager, or the
++/// media socket filesystem path.
++struct StartupPlan {
++    mode: RunMode,
++}
++
++impl StartupPlan {
++    fn build(config: &AppConfig, mode: RunMode, hook: &mut impl StartupHook) -> Result<Self, String> {
++        validate_zero2w_mfi_config(config)?;
++        match mode {
++            RunMode::InputOnly => {
++                hook.observe(StartupEffect::MfiStart);
++                hook.observe(StartupEffect::HomeKitStart);
++                hook.observe(StartupEffect::MediaServer);
++                hook.observe(StartupEffect::WirelessPreview);
++            }
++            RunMode::Bridge => {
++                // Retain the legacy bridge sequence only after the same MFi
++                // guard has accepted it. The real TX gadget is lazy inside
++                // ProdGadget; this marker documents that only bridge can reach it.
++                hook.observe(StartupEffect::GadgetCleanup);
++                hook.observe(StartupEffect::GadgetCleanup);
++                hook.observe(StartupEffect::MfiStart);
++                hook.observe(StartupEffect::HomeKitStart);
++                hook.observe(StartupEffect::MediaServer);
++                hook.observe(StartupEffect::OutputManager);
++                hook.observe(StartupEffect::TxPath);
++            }
++        }
++        Ok(Self { mode })
++    }
++}
+ 
+ fn parse_config(path: String) -> Result<AppConfig, String> {
+-    let config_str: String = fs::read_to_string(path).map_err(|err| format!("Failed to read config file: {}", err))?;
+-    let config: AppConfig = toml::from_str(&config_str).map_err(|err| format!("Failed to parse config file: {}", err))?;
+-    Ok(config)
++    let config_str: String = fs::read_to_string(path).map_err(|err| format!("Failed to read config file: {err}"))?;
++    toml::from_str(&config_str).map_err(|err| format!("Failed to parse config file: {err}"))
++}
++
++enum Runtime {
++    Bridge(Box<CarPlayOutputManager>),
++    InputOnly(InputOnlyManager),
++}
++
++impl Runtime {
++    async fn reconcile(&mut self) {
++        match self {
++            Self::Bridge(output) => {
++                let _ = output.reconcile().await;
++            }
++            Self::InputOnly(input) => input.reconcile().await,
++        }
++    }
++
++    async fn sleep(&mut self) {
++        match self {
++            Self::Bridge(output) => {
++                let _ = output.sleep().await;
++            }
++            Self::InputOnly(input) => {
++                let _ = input.sleep().await;
++            }
++        }
++    }
++
++    fn telemetry_snapshot(&mut self) -> TelemetrySnapshot {
++        match self {
++            Self::Bridge(output) => output.telemetry_snapshot(),
++            Self::InputOnly(input) => input.telemetry_snapshot(),
++        }
++    }
+ }
+ 
+ pub struct Main {
+-    // usb: Option<UsbInputManager>,
+-    // usb_out: Option<UsbOutputManager>,
+-    // bt: Option<BluetoothManager>,
+-    // wifi: Option<WifiManager>,
+-    mfi: Option<MfiManager>,
+-    // airplay: Option<AirPlayManager>,
+-    homekit: Option<HomeKitManager>,
+-    // input: Option<CarPlayInputManager>,
+-    output: Option<CarPlayOutputManager>,
++    // Keep authentication and HomeKit resources alive for whichever runtime is
++    // selected. Input-only does not own any USB/output resource.
++    _mfi: MfiManager,
++    _homekit: HomeKitManager,
++    runtime: Runtime,
+     telemetry: TelemetryServer,
+-}
+-
+-async fn wait_forever() -> Result<(), Box<dyn Error>> {
+-    signal::ctrl_c().await.expect("failed to listen for event");
+-    unsafe {
+-        libc::close(0);
+-    }
+-
+-    Ok(())
++    media: MediaServer,
+ }
+ 
+ impl Main {
+-    pub async fn start() -> Result<Main, Box<dyn Error>> {
+-        let config = parse_config("./c2a.toml".into()).or(parse_config("/etc/catplay/catplay.conf".into()))?;
+-
+-        if let Err(_err) = GadgetHelper::cleanup_once() {
+-            error!("Failed to clean up gadgets, continuing anyway");
+-        }
+-
+-        GadgetHelper::cleanup_once()?;
++    pub async fn start(mode: RunMode) -> Result<Main, Box<dyn Error>> {
++        let config = parse_config("./c2a.toml".into()).or_else(|_| parse_config("/etc/catplay/catplay.conf".into()))?;
++
++        // This is deliberately first after parsing. In particular, no MFi
++        // device lookup, I2C path construction, gadget cleanup, output manager,
++        // or media socket bind may happen before it succeeds.
++        let plan = StartupPlan::build(&config, mode, &mut NoopStartupHook).map_err(std::io::Error::other)?;
+ 
+         let mut mfi = MfiManager::new();
+-        mfi.start(&config)?;
+-
+         let mut homekit = HomeKitManager::default();
+-        homekit.start(&config, &mfi)?;
+-
+-        let (mut media, media_tap) = MediaTap::new();
+-        let mut output = CarPlayOutputManager::new(media_tap);
+-        output.start(&config, &mfi, &homekit)?;
++        let (runtime, media) = match plan.mode {
++            RunMode::InputOnly => {
++                // Branch before both legacy GadgetHelper cleanup calls. This
++                // branch has no CarPlayOutputManager, ProdGadget, TxAdapter,
++                // TX gadget, UDC, or configfs construction path.
++                mfi.start(&config)?;
++                homekit.start(&config, &mfi)?;
++                let (media, media_tap) = MediaTap::new();
++                let input = InputOnlyManager::start(&config, &mfi, &homekit, media_tap)?;
++                (Runtime::InputOnly(input), media)
++            }
++            RunMode::Bridge => {
++                if let Err(_err) = GadgetHelper::cleanup_once() {
++                    error!("Failed to clean up gadgets, continuing anyway");
++                }
++                GadgetHelper::cleanup_once()?;
++
++                mfi.start(&config)?;
++                homekit.start(&config, &mfi)?;
++                let (media, media_tap) = MediaTap::new();
++                let mut output = CarPlayOutputManager::new(media_tap);
++                output.start(&config, &mfi, &homekit)?;
++                (Runtime::Bridge(Box::new(output)), media)
++            }
++        };
+         let telemetry = TelemetryServer::bind_from_env()?;
+ 
+-        tokio::spawn(async move {
+-            let mut tick = interval(Duration::from_millis(3));
+-            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+-            loop { tick.tick().await; media.service_once(); }
+-        });
+-
+         Ok(Main {
+-            mfi: Some(mfi),
+-            homekit: Some(homekit),
+-            // input: Some(input),
+-            output: Some(output),
++            _mfi: mfi,
++            _homekit: homekit,
++            runtime,
+             telemetry,
++            media,
+         })
+     }
+ 
++    /// Runs all servers and reconcilers on the existing current-thread Tokio
++    /// runtime. The short timeout provides the CPMF service cadence without an
++    /// extra OS thread or unbounded worker queue.
+     pub async fn do_loop(&mut self) -> Result<(), Box<dyn Error>> {
+         loop {
+-            let output = self.output.as_mut().unwrap();
+-            let _ = output.reconcile().await;
+-            self.telemetry.publish(&output.telemetry_snapshot())?;
+-            output.sleep().await;
+-        }
+-
+-        #[allow(unreachable_code)]
+-        wait_forever().await?;
+-    }
+-}
++            self.media.service_once();
++            self.runtime.reconcile().await;
++            let snapshot = self.runtime.telemetry_snapshot();
++            self.telemetry.publish(&snapshot)?;
++            let _ = tokio::time::timeout(Duration::from_millis(3), self.runtime.sleep()).await;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{MfiConfig, MfiConfigI2C, ZERO2W_MFI_BUS_OFFSET, ZERO2W_MFI_DEVICE_ADDRESS};
++
++    #[derive(Default)]
++    struct Probe(Vec<StartupEffect>);
++
++    impl StartupHook for Probe {
++        fn observe(&mut self, effect: StartupEffect) {
++            self.0.push(effect);
++        }
++    }
++
++    fn allowed_config() -> AppConfig {
++        AppConfig {
++            mfi: MfiConfig {
++                i2c: Some(MfiConfigI2C {
++                    bus_offset: ZERO2W_MFI_BUS_OFFSET,
++                    dev_addr: ZERO2W_MFI_DEVICE_ADDRESS,
++                    timeout_ms: 100,
++                }),
++                ..MfiConfig::default()
++            },
++            ..AppConfig::default()
++        }
++    }
++
++    #[test]
++    fn unsafe_mfi_rejection_precedes_every_startup_effect() {
++        let mut config = allowed_config();
++        config.mfi.i2c.as_mut().unwrap().bus_offset = 2;
++        let mut probe = Probe::default();
++        assert!(StartupPlan::build(&config, RunMode::InputOnly, &mut probe).is_err());
++        assert!(
++            probe.0.is_empty(),
++            "no gadget, MFi, media, output, or TX effect may be planned first"
++        );
++
++        assert!(StartupPlan::build(&config, RunMode::Bridge, &mut probe).is_err());
++        assert!(probe.0.is_empty(), "bridge must use the same pre-side-effect guard");
++    }
++
++    #[test]
++    fn input_only_plan_has_zero_gadget_output_or_tx_calls() {
++        let mut probe = Probe::default();
++        let plan = StartupPlan::build(&allowed_config(), RunMode::InputOnly, &mut probe).unwrap();
++        assert_eq!(plan.mode, RunMode::InputOnly);
++        assert_eq!(
++            probe.0,
++            vec![
++                StartupEffect::MfiStart,
++                StartupEffect::HomeKitStart,
++                StartupEffect::MediaServer,
++                StartupEffect::WirelessPreview,
++            ]
++        );
++        assert!(!probe.0.contains(&StartupEffect::GadgetCleanup));
++        assert!(!probe.0.contains(&StartupEffect::OutputManager));
++        assert!(!probe.0.contains(&StartupEffect::TxPath));
++    }
++}
+--- a/c2a/catplay_c2a/src/telemetry.rs
++++ b/c2a/catplay_c2a/src/telemetry.rs
+@@ -25,8 +25,15 @@
+ const SLOW_CLIENT_DEADLINE: Duration = Duration::from_secs(2);
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+-pub enum TelemetryLifecycle { State(ProdGadgetState), Error }
+-impl From<&ProdGadgetState> for TelemetryLifecycle { fn from(value: &ProdGadgetState) -> Self { Self::State(value.clone()) } }
++pub enum TelemetryLifecycle {
++    State(ProdGadgetState),
++    Error,
++}
++impl From<&ProdGadgetState> for TelemetryLifecycle {
++    fn from(value: &ProdGadgetState) -> Self {
++        Self::State(value.clone())
++    }
++}
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+ pub struct TelemetrySnapshot {
+@@ -38,6 +45,7 @@
+     pub iphone_connected: bool,
+     pub vehicle_connected: bool,
+     pub bridge_active: bool,
++    pub input_only: bool,
+ }
+ 
+ impl TelemetrySnapshot {
+@@ -51,6 +59,7 @@
+             iphone_connected: false,
+             vehicle_connected: false,
+             bridge_active: false,
++            input_only: false,
+         }
+     }
+ 
+@@ -59,7 +68,19 @@
+         tx: Option<&CarPlayUsbClientGadgetStatus>,
+         rx: Option<&CarPlayWirelessGadgetState>,
+     ) -> Self {
+-        if matches!(&lifecycle, TelemetryLifecycle::Error) { return Self { schema_version: 1, engine: "catplay", lifecycle: lifecycle_name(lifecycle), wireless_listener_ready: false, wired_endpoint_ready: false, iphone_connected: false, vehicle_connected: false, bridge_active: false }; }
++        if matches!(&lifecycle, TelemetryLifecycle::Error) {
++            return Self {
++                schema_version: 1,
++                engine: "catplay",
++                lifecycle: lifecycle_name(lifecycle),
++                wireless_listener_ready: false,
++                wired_endpoint_ready: false,
++                iphone_connected: false,
++                vehicle_connected: false,
++                bridge_active: false,
++                input_only: false,
++            };
++        }
+ 
+         let wireless_listener_ready = matches!(
+             rx,
+@@ -88,7 +109,62 @@
+             iphone_connected,
+             vehicle_connected,
+             bridge_active: iphone_connected && vehicle_connected,
+-        }
++            input_only: false,
++        }
++    }
++
++    /// Maps only the live wireless reconciler state used by `--cp-input-only`.
++    /// Output-related fields are hard-coded false rather than inferred from any
++    /// configured gadget so a stale TX/UDC state cannot leak across modes.
++    pub fn from_input_only_wireless_state(rx: Option<&CarPlayWirelessGadgetState>) -> Self {
++        let wireless_listener_ready = matches!(
++            rx,
++            Some(CarPlayWirelessGadgetState::Inviting | CarPlayWirelessGadgetState::Receiving | CarPlayWirelessGadgetState::Passive)
++        );
++        let iphone_connected = matches!(rx, Some(CarPlayWirelessGadgetState::Receiving));
++        Self {
++            schema_version: 1,
++            engine: "catplay",
++            lifecycle: input_only_lifecycle_name(rx),
++            wireless_listener_ready,
++            wired_endpoint_ready: false,
++            iphone_connected,
++            vehicle_connected: false,
++            bridge_active: false,
++            input_only: true,
++        }
++    }
++
++    pub fn input_only_error() -> Self {
++        Self {
++            schema_version: 1,
++            engine: "catplay",
++            lifecycle: "input_error",
++            wireless_listener_ready: false,
++            wired_endpoint_ready: false,
++            iphone_connected: false,
++            vehicle_connected: false,
++            bridge_active: false,
++            input_only: true,
++        }
++    }
++}
++
++fn input_only_lifecycle_name(state: Option<&CarPlayWirelessGadgetState>) -> &'static str {
++    match state {
++        None => "input_initial",
++        Some(CarPlayWirelessGadgetState::Initial) => "input_initial",
++        Some(CarPlayWirelessGadgetState::WaitingForBluetooth { .. }) => "input_waiting_for_bluetooth",
++        Some(CarPlayWirelessGadgetState::StartingBluetooth { .. }) => "input_starting_bluetooth",
++        Some(CarPlayWirelessGadgetState::StartingBluetoothPower { .. }) => "input_powering_bluetooth",
++        Some(CarPlayWirelessGadgetState::StartingLastConnect { .. }) => "input_reconnecting",
++        Some(CarPlayWirelessGadgetState::WaitingForInterface { .. }) => "input_waiting_for_interface",
++        Some(CarPlayWirelessGadgetState::WaitingForInterfaceRunning { .. }) => "input_waiting_for_interface_running",
++        Some(CarPlayWirelessGadgetState::WaitingForStableMulticast { .. }) => "input_waiting_for_multicast",
++        Some(CarPlayWirelessGadgetState::StartingServer { .. }) => "input_starting_listener",
++        Some(CarPlayWirelessGadgetState::Inviting) => "input_inviting",
++        Some(CarPlayWirelessGadgetState::Receiving) => "input_receiving",
++        Some(CarPlayWirelessGadgetState::Passive) => "input_passive",
+     }
+ }
+ 
+@@ -122,8 +198,7 @@
+     fn record_would_block(&mut self, now: Instant) -> bool {
+         let blocked_since = self.blocked_since.get_or_insert(now);
+         self.would_block_retries = self.would_block_retries.saturating_add(1);
+-        self.would_block_retries >= MAX_WOULD_BLOCK_RETRIES
+-            || now.saturating_duration_since(*blocked_since) >= SLOW_CLIENT_DEADLINE
++        self.would_block_retries >= MAX_WOULD_BLOCK_RETRIES || now.saturating_duration_since(*blocked_since) >= SLOW_CLIENT_DEADLINE
+     }
+ 
+     fn clear_blocked(&mut self) {
+@@ -157,7 +232,7 @@
+         listener.set_nonblocking(true)?;
+         let metadata = fs::symlink_metadata(path)?;
+         if !metadata.file_type().is_socket() {
+-            return Err(io::Error::new(ErrorKind::Other, "telemetry bind did not create a socket"));
++            return Err(io::Error::other("telemetry bind did not create a socket"));
+         }
+         let latest = encode_line(&TelemetrySnapshot::initial())?;
+         Ok(Self {
+@@ -213,10 +288,7 @@
+         while index < self.clients.len() {
+             let now = Instant::now();
+             let client = &mut self.clients[index];
+-            let write = client
+-                .pending
+-                .as_ref()
+-                .map(|line| (client.stream.try_write(line), line.len()));
++            let write = client.pending.as_ref().map(|line| (client.stream.try_write(line), line.len()));
+             let remove = match write {
+                 None => false,
+                 Some((Ok(0), _)) => true,
+@@ -229,9 +301,7 @@
+                 // A peer which never drains must not consume one of the four
+                 // slots forever. The retry count bounds eviction even if the
+                 // monotonic clock is not observed past the deadline yet.
+-                Some((Err(err), _)) if err.kind() == ErrorKind::WouldBlock => {
+-                    client.record_would_block(now)
+-                }
++                Some((Err(err), _)) if err.kind() == ErrorKind::WouldBlock => client.record_would_block(now),
+                 Some((Err(_), _)) => true,
+             };
+             if remove {
+@@ -301,7 +371,7 @@
+     use std::{
+         fs,
+         os::unix::{
+-            fs::{symlink, PermissionsExt},
++            fs::{PermissionsExt, symlink},
+             net::UnixListener as StdUnixListener,
+         },
+         path::PathBuf,
+@@ -324,7 +394,11 @@
+ 
+     #[test]
+     fn false_readiness_before_real_gadget_states() {
+-        let snapshot = TelemetrySnapshot::from_gadget_states(TelemetryLifecycle::from(&ProdGadgetState::Initial), Some(&CarPlayUsbClientGadgetStatus::Initial), None);
++        let snapshot = TelemetrySnapshot::from_gadget_states(
++            TelemetryLifecycle::from(&ProdGadgetState::Initial),
++            Some(&CarPlayUsbClientGadgetStatus::Initial),
++            None,
++        );
+         assert_eq!(snapshot.lifecycle, "initial");
+         assert!(!snapshot.wireless_listener_ready);
+         assert!(!snapshot.wired_endpoint_ready);
+@@ -351,6 +425,38 @@
+             Some(&CarPlayWirelessGadgetState::Receiving),
+         );
+         assert!(active.bridge_active);
++    }
++
++    #[test]
++    fn input_only_mapping_cannot_claim_any_output_state() {
++        let initial = TelemetrySnapshot::from_input_only_wireless_state(Some(&CarPlayWirelessGadgetState::Initial));
++        assert_eq!(initial.lifecycle, "input_initial");
++        assert!(!initial.wireless_listener_ready);
++        assert!(!initial.iphone_connected);
++
++        let inviting = TelemetrySnapshot::from_input_only_wireless_state(Some(&CarPlayWirelessGadgetState::Inviting));
++        assert_eq!(inviting.lifecycle, "input_inviting");
++        assert!(inviting.wireless_listener_ready);
++        assert!(!inviting.iphone_connected);
++
++        let receiving = TelemetrySnapshot::from_input_only_wireless_state(Some(&CarPlayWirelessGadgetState::Receiving));
++        assert_eq!(receiving.lifecycle, "input_receiving");
++        assert!(receiving.wireless_listener_ready);
++        assert!(receiving.iphone_connected);
++
++        for snapshot in [initial, inviting, receiving, TelemetrySnapshot::input_only_error()] {
++            assert!(snapshot.input_only);
++            let line = encode_line(&snapshot).unwrap();
++            let json: serde_json::Value = serde_json::from_slice(&line).unwrap();
++            assert_eq!(json["input_only"], true);
++            assert!(!snapshot.wired_endpoint_ready);
++            assert!(!snapshot.vehicle_connected);
++            assert!(!snapshot.bridge_active);
++            let lifecycle = snapshot.lifecycle.to_ascii_lowercase();
++            assert!(!lifecycle.contains("udc"));
++            assert!(!lifecycle.contains("gadget"));
++            assert!(!lifecycle.contains("tx"));
++        }
+     }
+ 
+     #[test]
+@@ -361,6 +467,7 @@
+         let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+         assert_eq!(value["schema_version"], 1);
+         assert_eq!(value["engine"], "catplay");
++        assert_eq!(value["input_only"], false);
+         assert_eq!(value["lifecycle"], "initial");
+     }
+ 
+@@ -386,10 +493,7 @@
+         let link = dir.join("link");
+         symlink(&target, &link).unwrap();
+         assert_eq!(
+-            TelemetryServer::bind(&link.join("catplay.sock"))
+-                .err()
+-                .unwrap()
+-                .kind(),
++            TelemetryServer::bind(&link.join("catplay.sock")).err().unwrap().kind(),
+             ErrorKind::PermissionDenied
+         );
+         cleanup(&link);
+@@ -467,10 +571,7 @@
+         }
+         server.service();
+         assert_eq!(server.client_count(), MAX_CLIENTS);
+-        tokio::time::timeout(Duration::from_secs(1), peers[MAX_CLIENTS].readable())
+-            .await
+-            .unwrap()
+-            .unwrap();
++        tokio::time::timeout(Duration::from_secs(1), peers[MAX_CLIENTS].readable()).await.unwrap().unwrap();
+         assert_eq!(peers[MAX_CLIENTS].try_read(&mut [0]).unwrap(), 0);
+ 
+         let (stream, _peer) = UnixStream::pair().unwrap();
+--- a/c2a/catplay_c2a/src/media_ipc.rs
++++ b/c2a/catplay_c2a/src/media_ipc.rs
+@@ -9,9 +9,9 @@
+     },
+     path::{Path, PathBuf},
+     sync::{
++        Arc, Mutex,
+         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+-        Arc, Mutex,
++        mpsc::{self, Receiver, SyncSender, TryRecvError},
+     },
+     time::{Duration, Instant},
+ };
+@@ -19,26 +19,29 @@
+ use catplay_carplay::{
+     audio::{AudioCodec, AudioStreamBasicDescription},
+     carplay_rx::AirPlayReceiverHandleRef,
+-    msg::{AudioFormat, AudioType, StreamType},
++    msg::{AudioFormat, AudioType, HidDevice, StreamType},
+     video::{AvccConfigExtended, EncodedVideoFrame},
+ };
+-use log::warn;
+-
+ const SOCKET: &str = "/run/zero2w/catplay-media-v1.sock";
+ const HEADER: usize = 64;
+ const MAX_PAYLOAD: usize = 1_048_576;
+ const MAX_CONFIG: usize = 65_536;
+ const MAX_AUDIO: usize = 3_840;
+-const VIDEO_CAP: usize = 2;
+-const AUDIO_CAP: usize = 8;
++// Two simultaneous displays can burst while the single-thread reconciler is
++// handling RTSP/control work. Eight encoded frames bound the queue to 8 MiB
++// worst case while covering about 89 ms at the offered 60+30 fps.
++const VIDEO_CAP: usize = 8;
++// Two 10 ms PCM streams can produce 200 chunks/s. Thirty-two chunks cost at
++// most 120 KiB and cover 160 ms of a dual-stream reconciler stall.
++const AUDIO_CAP: usize = 32;
+ const CONTROL_CAP: usize = 16;
+ const HEARTBEAT: Duration = Duration::from_secs(1);
+ const WRITE_DEADLINE: Duration = Duration::from_millis(100);
+ const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
+ const MAX_ACCEPTS_PER_SERVICE: usize = 2;
+ const MAX_CONTROL_PER_SERVICE: usize = 4;
+-const MAX_VIDEO_PER_SERVICE: usize = 1;
+-const MAX_AUDIO_PER_SERVICE: usize = 1;
++const MAX_VIDEO_PER_SERVICE: usize = 4;
++const MAX_AUDIO_PER_SERVICE: usize = 8;
+ /// At a 3 ms current-thread cadence this limits a healthy consumer write offer to 64 KiB.
+ const MAX_WRITE_BYTES_PER_SERVICE: usize = 64 * 1024;
+ 
+@@ -51,20 +54,39 @@
+ const AUDIO_START: u16 = 0x0020;
+ const AUDIO_CHUNK: u16 = 0x0021;
+ const AUDIO_END: u16 = 0x0022;
++const AUDIO_GAIN: u16 = 0x0023;
+ const SERVER_HELLO: u16 = 0x0001;
+ const HEARTBEAT_RECORD: u16 = 0x0002;
+ const REQUEST_KEYFRAME: u16 = 0x8001;
++const TOUCH: u16 = 0x8002;
+ const KEYFRAME: u16 = 1;
+ const DISCONTINUITY: u16 = 2;
++const MAIN_DISPLAY_UUID: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001080";
++const ALT_DISPLAY_UUID: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001081";
+ 
+ #[derive(Clone)]
+ pub struct MediaTap {
+     inner: Arc<Inner>,
+ }
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[repr(u32)]
++pub enum VideoRole {
++    Main = 0,
++    Alt = 1,
++}
++
++fn display_uuid(role: VideoRole) -> &'static str {
++    match role {
++        VideoRole::Main => MAIN_DISPLAY_UUID,
++        VideoRole::Alt => ALT_DISPLAY_UUID,
++    }
++}
++
+ pub struct VideoTap {
+     tap: MediaTap,
+     session: u64,
+     stream: u32,
++    role: VideoRole,
+     sequence: AtomicU64,
+     config_id: AtomicU32,
+ }
+@@ -89,11 +111,12 @@
+ enum Control {
+     SessionBegin(u64),
+     SessionEnd(u64, u32),
+-    VideoStart(u64, u32),
++    VideoStart(u64, u32, VideoRole),
+     VideoConfig(u64, u32, u32, AvccConfigExtended),
+     VideoEnd(u64, u32, u32),
+     AudioStart(u64, u32, AudioMeta),
+     AudioEnd(u64, u32, u32),
++    AudioGain(u64, u32, u32),
+ }
+ struct Video {
+     session: u64,
+@@ -123,10 +146,15 @@
+     audio_count: AtomicUsize,
+     connected: AtomicBool,
+     fatal: AtomicBool,
++    /// Current active session epoch. It may be cleared during teardown.
+     session: AtomicU64,
++    /// Monotonic epoch allocator. It is deliberately independent from `session`.
++    next_session: AtomicU64,
+     next_stream: AtomicU32,
+     handle: Mutex<Option<AirPlayReceiverHandleRef>>,
+-    last_keyframe: Mutex<Instant>,
++    touch_device: Mutex<Option<HidDevice>>,
++    /// Main and AltScreen must not suppress each other's keyframe requests.
++    last_keyframe: Mutex<[Instant; 2]>,
+ }
+ 
+ impl MediaTap {
+@@ -147,9 +175,11 @@
+             connected: AtomicBool::new(false),
+             fatal: AtomicBool::new(false),
+             session: AtomicU64::new(0),
++            next_session: AtomicU64::new(1),
+             next_stream: AtomicU32::new(1),
+             handle: Mutex::new(None),
+-            last_keyframe: Mutex::new(Instant::now() - KEYFRAME_INTERVAL),
++            touch_device: Mutex::new(None),
++            last_keyframe: Mutex::new([Instant::now() - KEYFRAME_INTERVAL; 2]),
+         });
+         (
+             MediaServer::bind_from_env(inner.clone()).expect("media socket bind failed"),
+@@ -171,29 +201,78 @@
+             self.inner.fatal.store(true, Ordering::Release);
+         }
+     }
+-    pub fn begin_session(&self, handle: AirPlayReceiverHandleRef) {
+-        let id = self.inner.session.fetch_add(1, Ordering::AcqRel) + 1;
++    /// Allocates a non-zero epoch without ever deriving it from the clearable
++    /// active-session slot. On integer wrap it restarts at one rather than
++    /// emitting the reserved zero epoch; practical reuse would require 2^64
++    /// completed sessions.
++    fn allocate_session_epoch(&self) -> u64 {
++        loop {
++            let observed = self.inner.next_session.load(Ordering::Acquire);
++            let epoch = if observed == 0 { 1 } else { observed };
++            let following = epoch.checked_add(1).unwrap_or(1);
++            if self
++                .inner
++                .next_session
++                .compare_exchange(observed, following, Ordering::AcqRel, Ordering::Acquire)
++                .is_ok()
++            {
++                return epoch;
++            }
++        }
++    }
++
++    /// Starts a media session and returns its owner epoch.
++    ///
++    /// Owners must retain this value and use `end_session_for_epoch`; loading
++    /// the active slot during teardown would let a delayed old owner clear a
++    /// newer session.
++    pub fn begin_session(&self, handle: AirPlayReceiverHandleRef) -> u64 {
++        let id = self.allocate_session_epoch();
+         *self.inner.handle.lock().unwrap() = Some(handle);
++        self.inner.session.store(id, Ordering::Release);
+         self.control(Control::SessionBegin(id));
+-    }
++        id
++    }
++
++    /// Clears only the supplied owner epoch. A delayed teardown from an older
++    /// session cannot clear a subsequently started session.
++    pub fn end_session_for_epoch(&self, id: u64, reason: u32) {
++        if id != 0 && self.inner.session.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
++            self.control(Control::SessionEnd(id, reason));
++            *self.inner.handle.lock().unwrap() = None;
++        }
++    }
++
++    /// Legacy bridge teardown. Input-only owners must use
++    /// `end_session_for_epoch` with their stored epoch.
+     pub fn end_session(&self, reason: u32) {
+         let id = self.inner.session.load(Ordering::Acquire);
+-        if id != 0 {
+-            self.control(Control::SessionEnd(id, reason));
+-        }
+-        *self.inner.handle.lock().unwrap() = None;
+-    }
+-    pub fn video_stream(&self) -> VideoTap {
++        self.end_session_for_epoch(id, reason);
++    }
++    pub fn video_stream(&self, role: VideoRole) -> VideoTap {
+         let session = self.inner.session.load(Ordering::Acquire);
+         let stream = self.inner.next_stream.fetch_add(1, Ordering::AcqRel);
+-        self.control(Control::VideoStart(session, stream));
++        self.control(Control::VideoStart(session, stream, role));
+         VideoTap {
+             tap: self.clone(),
+             session,
+             stream,
++            role,
+             sequence: AtomicU64::new(0),
+             config_id: AtomicU32::new(0),
+         }
++    }
++    pub fn set_touch_device(&self, device: HidDevice) {
++        *self.inner.touch_device.lock().unwrap() = Some(device);
++    }
++    pub fn set_audio_gain_db(&self, duration_ms: f64, db: f64) {
++        let session = self.inner.session.load(Ordering::Acquire);
++        if session == 0 || !duration_ms.is_finite() || !db.is_finite() {
++            return;
++        }
++        let duration = duration_ms.clamp(0.0, 60_000.0).round() as u32;
++        let gain = (10_f64.powf(db.clamp(-144.0, 0.0) / 20.0) * 1_000_000.0).round() as u32;
++        self.control(Control::AudioGain(session, duration, gain.min(1_000_000)));
+     }
+     pub fn audio_stream(&self, meta: AudioMeta) -> AudioTap {
+         let session = self.inner.session.load(Ordering::Acquire);
+@@ -208,20 +287,76 @@
+             ended: AtomicBool::new(false),
+         }
+     }
+-    fn request_keyframe(&self) {
++    fn request_keyframe(&self, role: VideoRole) {
+         let mut last = self.inner.last_keyframe.lock().unwrap();
+-        if last.elapsed() >= KEYFRAME_INTERVAL {
++        let index = role as usize;
++        if last[index].elapsed() >= KEYFRAME_INTERVAL {
+             if let Some(handle) = self.inner.handle.lock().unwrap().as_ref() {
+-                handle.request_keyframe();
+-                *last = Instant::now();
+-            }
+-        }
++                handle.request_keyframe_for_display(display_uuid(role));
++                last[index] = Instant::now();
++            }
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_tap() -> Self {
++        let (control, control_rx) = mpsc::sync_channel(CONTROL_CAP);
++        let (video, video_rx) = mpsc::sync_channel(VIDEO_CAP);
++        let (audio, audio_rx) = mpsc::sync_channel(AUDIO_CAP);
++        Self {
++            inner: Arc::new(Inner {
++                control,
++                control_rx: Mutex::new(control_rx),
++                control_count: AtomicUsize::new(0),
++                video,
++                video_rx: Mutex::new(video_rx),
++                video_count: AtomicUsize::new(0),
++                audio,
++                audio_rx: Mutex::new(audio_rx),
++                audio_count: AtomicUsize::new(0),
++                connected: AtomicBool::new(false),
++                fatal: AtomicBool::new(false),
++                session: AtomicU64::new(0),
++                next_session: AtomicU64::new(1),
++                next_stream: AtomicU32::new(1),
++                handle: Mutex::new(None),
++                touch_device: Mutex::new(None),
++                last_keyframe: Mutex::new([Instant::now() - KEYFRAME_INTERVAL; 2]),
++            }),
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_set_connected(&self, connected: bool) {
++        self.inner.connected.store(connected, Ordering::Release);
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_begin_session(&self) -> u64 {
++        let id = self.allocate_session_epoch();
++        self.inner.session.store(id, Ordering::Release);
++        self.control(Control::SessionBegin(id));
++        id
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_active_session(&self) -> u64 {
++        self.inner.session.load(Ordering::Acquire)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_queue_counts(&self) -> (usize, usize, usize) {
++        (
++            self.inner.control_count.load(Ordering::Acquire),
++            self.inner.video_count.load(Ordering::Acquire),
++            self.inner.audio_count.load(Ordering::Acquire),
++        )
+     }
+ }
+ impl VideoTap {
+     pub fn config(&self, config: AvccConfigExtended) {
+         if !valid_config(&config.avcc.sps_pps) {
+-            self.tap.request_keyframe();
++            self.tap.request_keyframe(self.role);
+             return;
+         }
+         let id = self.config_id.fetch_add(1, Ordering::AcqRel) + 1;
+@@ -239,7 +374,7 @@
+             || frame.height > 4096
+             || (frame.width as u64 * frame.height as u64) > 8_847_360
+         {
+-            self.tap.request_keyframe();
++            self.tap.request_keyframe(self.role);
+             return;
+         }
+         if self
+@@ -249,7 +384,7 @@
+             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < VIDEO_CAP).then_some(n + 1))
+             .is_err()
+         {
+-            self.tap.request_keyframe();
++            self.tap.request_keyframe(self.role);
+             return;
+         }
+         let event = Video {
+@@ -262,7 +397,7 @@
+         };
+         if self.tap.inner.video.try_send(event).is_err() {
+             self.tap.inner.video_count.fetch_sub(1, Ordering::AcqRel);
+-            self.tap.request_keyframe();
++            self.tap.request_keyframe(self.role);
+         }
+     }
+ }
+@@ -344,11 +479,19 @@
+     at: usize,
+     started: Instant,
+ }
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum ClientRequest {
++    Keyframe { session: u64, stream: u32 },
++    Touch { session: u64, sequence: u64, phase: u32, x: u32, y: u32, role: u32 },
++}
+ #[derive(Default)]
+ struct Snapshot {
+     session: u64,
+-    video: Option<(u32, u32, Vec<u8>, u32, u32)>,
++    // stream, role, config id, SPS/PPS, width, height. Capacity is two.
++    video: Vec<(u32, VideoRole, u32, Vec<u8>, u32, u32)>,
+     audio: Vec<(u32, AudioMeta)>,
++    // duration milliseconds, linear gain parts-per-million, generation.
++    audio_gain: (u32, u32, u32),
+ }
+ impl MediaServer {
+     fn bind_from_env(inner: Arc<Inner>) -> io::Result<Self> {
+@@ -407,7 +550,8 @@
+                     });
+                     self.enqueue(hello());
+                     self.snapshot();
+-                    self.request_keyframe();
++                    self.request_keyframe(VideoRole::Main);
++                    self.request_keyframe(VideoRole::Alt);
+                 }
+                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                 Err(_) => break,
+@@ -468,9 +612,11 @@
+             Control::SessionBegin(id) => {
+                 self.state = Snapshot {
+                     session: id,
++                    audio_gain: (0, 1_000_000, 1),
+                     ..Default::default()
+                 };
+                 self.enqueue(record(SESSION_BEGIN, 0, id, 0, 0, 0, &[], [0; 4]));
++                self.enqueue(record(AUDIO_GAIN, 0, id, 0, 0, 0, &[], [0, 1_000_000, 0, 1]));
+             }
+             Control::SessionEnd(id, reason) => {
+                 if self.state.session == id {
+@@ -478,17 +624,29 @@
+                     self.state = Snapshot::default();
+                 }
+             }
+-            Control::VideoStart(s, st) => self.enqueue(record(VIDEO_START, 0, s, st, 0, 0, &[], [0; 4])),
++            Control::VideoStart(s, st, role) => {
++                self.state.video.retain(|(_, existing, ..)| *existing != role);
++                if self.state.video.len() < 2 {
++                    self.state.video.push((st, role, 0, Vec::new(), 0, 0));
++                }
++                self.enqueue(record(VIDEO_START, 0, s, st, 0, 0, &[], [role as u32, 0, 0, 0]));
++            }
+             Control::VideoConfig(s, st, id, cfg) => {
+                 let bytes = cfg.avcc.sps_pps;
+                 if !valid_config(&bytes) {
+                     self.enqueue(record(VIDEO_CONFIG, 0, s, st, 0, 0, &[], [0, cfg.width, cfg.height, id]));
+-                } else {
+-                    self.state.video = Some((st, id, bytes.clone(), cfg.width, cfg.height));
++                } else if let Some(video) = self.state.video.iter_mut().find(|value| value.0 == st) {
++                    video.2 = id;
++                    video.3 = bytes.clone();
++                    video.4 = cfg.width;
++                    video.5 = cfg.height;
+                     self.enqueue(record(VIDEO_CONFIG, 0, s, st, 0, 0, &bytes, [1, cfg.width, cfg.height, id]));
+                 }
+             }
+-            Control::VideoEnd(s, st, r) => self.enqueue(record(VIDEO_END, 0, s, st, 0, 0, &[], [r, 0, 0, 0])),
++            Control::VideoEnd(s, st, r) => {
++                self.state.video.retain(|value| value.0 != st);
++                self.enqueue(record(VIDEO_END, 0, s, st, 0, 0, &[], [r, 0, 0, 0]));
++            }
+             Control::AudioStart(s, st, meta) => {
+                 self.state.audio.retain(|(id, _)| *id != st);
+                 if self.state.audio.len() == 2 {
+@@ -501,10 +659,20 @@
+                 self.state.audio.retain(|(id, _)| *id != st);
+                 self.enqueue(record(AUDIO_END, 0, s, st, 0, 0, &[], [r, 0, 0, 0]));
+             }
++            Control::AudioGain(s, duration, gain) => {
++                if self.state.session == s {
++                    let generation = self.state.audio_gain.2.saturating_add(1).max(1);
++                    self.state.audio_gain = (duration, gain, generation);
++                    self.enqueue(record(AUDIO_GAIN, 0, s, 0, 0, 0, &[], [duration, gain, 0, generation]));
++                }
++            }
+         }
+     }
+     fn video_event(&mut self, e: Video) {
+-        if self.state.session != e.session || self.state.video.as_ref().map(|v| v.0) != Some(e.stream) || e.config == 0 {
++        if self.state.session != e.session
++            || !self.state.video.iter().any(|value| value.0 == e.stream && value.2 == e.config)
++            || e.config == 0
++        {
+             return;
+         }
+         let mut flags = if e.frame.is_known_keyframe() { KEYFRAME } else { 0 };
+@@ -609,22 +777,40 @@
+             self.close();
+             return;
+         }
+-        if let Some((session, stream)) = target {
+-            #[cfg(test)]
+-            {
+-                self.last_request = Some((session, stream));
+-            }
+-            if session == self.state.session && self.state.video.as_ref().map(|v| v.0) == Some(stream) {
+-                self.request_keyframe();
+-            }
+-        }
+-    }
+-    fn request_keyframe(&self) {
++        match target {
++            Some(ClientRequest::Keyframe { session, stream }) => {
++                #[cfg(test)]
++                { self.last_request = Some((session, stream)); }
++                let role = (session == self.state.session)
++                    .then(|| self.state.video.iter().find(|value| value.0 == stream).map(|value| value.1))
++                    .flatten();
++                if let Some(role) = role { self.request_keyframe(role); }
++            }
++            Some(ClientRequest::Touch { session, sequence: _, phase, x, y, role }) => {
++                let dimensions = (session == self.state.session && role == VideoRole::Main as u32)
++                    .then(|| self.state.video.iter().find(|value| value.1 == VideoRole::Main).map(|value| (value.4, value.5)))
++                    .flatten();
++                if let Some((width, height)) = dimensions {
++                    if x < width && y < height {
++                        let report = crate::preview_rx::touch_report(phase != 0, x as u16, y as u16);
++                        let handle = self.inner.handle.lock().unwrap();
++                        let device = self.inner.touch_device.lock().unwrap();
++                        if let (Some(handle), Some(device)) = (handle.as_ref(), device.as_ref()) {
++                            handle.send_hid_report(Instant::now(), device, &report);
++                        }
++                    }
++                }
++            }
++            None => {}
++        }
++    }
++    fn request_keyframe(&self, role: VideoRole) {
+         let mut last = self.inner.last_keyframe.lock().unwrap();
+-        if last.elapsed() >= KEYFRAME_INTERVAL {
++        let index = role as usize;
++        if last[index].elapsed() >= KEYFRAME_INTERVAL {
+             if let Some(h) = self.inner.handle.lock().unwrap().as_ref() {
+-                h.request_keyframe();
+-                *last = Instant::now();
++                h.request_keyframe_for_display(display_uuid(role));
++                last[index] = Instant::now();
+             }
+         }
+     }
+@@ -634,12 +820,18 @@
+             return;
+         }
+         self.enqueue(record(SESSION_BEGIN, 4, s, 0, 0, 0, &[], [0; 4]));
+-        if let Some((st, id, bytes, w, h)) = self.state.video.clone() {
+-            self.enqueue(record(VIDEO_START, 4, s, st, 0, 0, &[], [0; 4]));
+-            self.enqueue(record(VIDEO_CONFIG, 4, s, st, 0, 0, &bytes, [1, w, h, id]));
++        for (st, role, id, bytes, w, h) in self.state.video.clone() {
++            self.enqueue(record(VIDEO_START, 4, s, st, 0, 0, &[], [role as u32, 0, 0, 0]));
++            if id != 0 {
++                self.enqueue(record(VIDEO_CONFIG, 4, s, st, 0, 0, &bytes, [1, w, h, id]));
++            }
+         }
+         for (st, m) in self.state.audio.clone() {
+             self.enqueue(audio_start(s, st, m, 4));
++        }
++        let (duration, gain, generation) = self.state.audio_gain;
++        if generation != 0 {
++            self.enqueue(record(AUDIO_GAIN, 4, s, 0, 0, 0, &[], [duration, gain, 0, generation]));
+         }
+     }
+ }
+@@ -680,19 +872,30 @@
+ fn queue_order(prefer_audio: bool) -> [bool; 2] {
+     [prefer_audio, !prefer_audio]
+ }
+-fn request_target(h: &[u8]) -> Option<(u64, u32)> {
+-    if h.len() != HEADER
+-        || &h[..4] != b"CPMF"
+-        || h[4] != 1
+-        || h[5] != 0
+-        || u16be(&h[6..8]) != HEADER as u16
+-        || u16be(&h[8..10]) != REQUEST_KEYFRAME
+-        || h[10..12].iter().any(|b| *b != 0)
+-        || h[24..].iter().any(|b| *b != 0)
+-    {
++fn request_target(h: &[u8]) -> Option<ClientRequest> {
++    if h.len() != HEADER || &h[..4] != b"CPMF" || h[4] != 1 || h[5] != 0 || u16be(&h[6..8]) != HEADER as u16
++        || h[10..12].iter().any(|b| *b != 0) || h[60..64].iter().any(|b| *b != 0) {
+         return None;
+     }
+-    Some((u64be(&h[16..24]), u32be(&h[12..16])))
++    let session = u64be(&h[16..24]);
++    match u16be(&h[8..10]) {
++        REQUEST_KEYFRAME if session != 0 && h[24..60].iter().all(|b| *b == 0) => Some(ClientRequest::Keyframe {
++            session,
++            stream: u32be(&h[12..16]),
++        }),
++        TOUCH if session != 0 && h[12..16].iter().all(|b| *b == 0) && u64be(&h[24..32]) != 0
++            && h[32..44].iter().all(|b| *b == 0) && u32be(&h[44..48]) <= 2 && u32be(&h[56..60]) == 0 => {
++            Some(ClientRequest::Touch {
++                session,
++                sequence: u64be(&h[24..32]),
++                phase: u32be(&h[44..48]),
++                x: u32be(&h[48..52]),
++                y: u32be(&h[52..56]),
++                role: u32be(&h[56..60]),
++            })
++        }
++        _ => None,
++    }
+ }
+ fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+@@ -706,11 +909,7 @@
+             &mut len,
+         )
+     };
+-    if r == 0 {
+-        Ok(cred.uid)
+-    } else {
+-        Err(io::Error::last_os_error())
+-    }
++    if r == 0 { Ok(cred.uid) } else { Err(io::Error::last_os_error()) }
+ }
+ fn record(kind: u16, flags: u16, session: u64, stream: u32, seq: u64, pts: u64, payload: &[u8], p: [u32; 4]) -> Vec<u8> {
+     let mut out = Vec::with_capacity(HEADER + payload.len());
+@@ -872,9 +1071,11 @@
+             connected: AtomicBool::new(false),
+             fatal: AtomicBool::new(false),
+             session: AtomicU64::new(0),
++            next_session: AtomicU64::new(1),
+             next_stream: AtomicU32::new(1),
+             handle: Mutex::new(None),
+-            last_keyframe: Mutex::new(Instant::now() - KEYFRAME_INTERVAL),
++            touch_device: Mutex::new(None),
++            last_keyframe: Mutex::new([Instant::now() - KEYFRAME_INTERVAL; 2]),
+         })
+     }
+     fn test_server(dir: &TempSocketDir) -> MediaServer {
+@@ -1055,12 +1256,26 @@
+     fn request(session: u64, stream: u32) -> Vec<u8> {
+         record(REQUEST_KEYFRAME, 0, session, stream, 0, 0, &[], [0; 4])
+     }
++    fn touch_request(session: u64, sequence: u64, phase: u32, x: u32, y: u32) -> Vec<u8> {
++        record(TOUCH, 0, session, 0, sequence, 0, &[], [phase, x, y, 0])
++    }
++    #[test]
++    fn touch_request_is_strict_and_bounded() {
++        let request = touch_request(91, 7, 2, 1919, 1079);
++        assert_eq!(request_target(&request), Some(ClientRequest::Touch { session: 91, sequence: 7, phase: 2, x: 1919, y: 1079, role: 0 }));
++        let mut bad_phase = request.clone();
++        bad_phase[47] = 3;
++        assert_eq!(request_target(&bad_phase), None);
++        let mut payload = request.clone();
++        payload[43] = 1;
++        assert_eq!(request_target(&payload), None);
++    }
+     #[test]
+     fn real_client_reverse_keyframe_request_parses_exact_session_and_stream() {
+         let dir = TempSocketDir::new();
+         let mut server = test_server(&dir);
+         server.state.session = 91;
+-        server.state.video = Some((17, 1, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 1, 1));
++        server.state.video = vec![(17, VideoRole::Main, 1, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 1, 1)];
+         let mut client = UnixStream::connect(dir.socket()).unwrap();
+         server.service_once();
+         client.write_all(&request(91, 17)).unwrap();
+@@ -1109,16 +1324,20 @@
+         let m = meta();
+         server.state = Snapshot {
+             session: 7,
+-            video: Some((3, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)),
++            video: vec![
++                (3, VideoRole::Main, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480),
++                (6, VideoRole::Alt, 7, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 800, 480),
++            ],
+             audio: vec![(4, m), (5, m)],
++            audio_gain: (250, 100_000, 3),
+         };
+         for _ in 0..2 {
+             let mut client = UnixStream::connect(dir.socket()).unwrap();
+             client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+-            for _ in 0..6 {
++            for _ in 0..9 {
+                 server.service_once();
+             }
+-            let kinds: Vec<_> = (0..6)
++            let kinds: Vec<_> = (0..9)
+                 .map(|_| {
+                     let r = read_record(&mut client);
+                     assert!(r.len() <= HEADER + MAX_CONFIG);
+@@ -1127,7 +1346,7 @@
+                 .collect();
+             assert_eq!(
+                 kinds,
+-                vec![SERVER_HELLO, SESSION_BEGIN, VIDEO_START, VIDEO_CONFIG, AUDIO_START, AUDIO_START]
++                vec![SERVER_HELLO, SESSION_BEGIN, VIDEO_START, VIDEO_CONFIG, VIDEO_START, VIDEO_CONFIG, AUDIO_START, AUDIO_START, AUDIO_GAIN]
+             );
+             drop(client);
+             server.service_once();
+@@ -1165,25 +1384,28 @@
+         let m = meta();
+         server.state = Snapshot {
+             session: 7,
+-            video: Some((3, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)),
++            video: vec![(3, VideoRole::Main, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)],
+             audio: vec![(4, m)],
++            audio_gain: (0, 1_000_000, 1),
+         };
+         let mut kinds = Vec::new();
+         for sequence in 1..=8 {
+             assert!(server.inner.video.try_send(video(sequence)).is_ok());
+             server.inner.video_count.fetch_add(1, Ordering::AcqRel);
+-            assert!(server
+-                .inner
+-                .audio
+-                .try_send(Audio {
+-                    session: 7,
+-                    stream: 4,
+-                    sequence,
+-                    meta: m,
+-                    samples: vec![1; 32],
+-                    discontinuity: false
+-                })
+-                .is_ok());
++            assert!(
++                server
++                    .inner
++                    .audio
++                    .try_send(Audio {
++                        session: 7,
++                        stream: 4,
++                        sequence,
++                        meta: m,
++                        samples: vec![1; 32],
++                        discontinuity: false
++                    })
++                    .is_ok()
++            );
+             server.inner.audio_count.fetch_add(1, Ordering::AcqRel);
+             server.service_once();
+             server.service_once();
+@@ -1226,4 +1448,54 @@
+         pcm.bits_per_channel = 24;
+         assert!(!valid_pcm(pcm));
+     }
+-}
++
++    #[test]
++    fn session_epochs_reject_stale_pcm_and_old_teardown() {
++        let inner = test_inner();
++        let tap = MediaTap { inner: inner.clone() };
++        let first = tap.test_begin_session();
++        tap.end_session(1);
++        let second = tap.test_begin_session();
++        assert_ne!(first, second);
++        assert_ne!(second, 0);
++
++        // A delayed first-session teardown must not clear the new active epoch.
++        tap.end_session_for_epoch(first, 2);
++        assert_eq!(tap.test_active_session(), second);
++
++        // Queue old PCM through the production drain path. It must not create
++        // an outbound record while the server has the newer active epoch.
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        server.state.session = second;
++        server.client = Some(Client {
++            io: Box::new(ShortWriter {
++                writes: Arc::new(Mutex::new(Vec::new())),
++                amount: 1,
++                blocks: 0,
++            }),
++            pending: None,
++            queue: VecDeque::new(),
++            read: Vec::new(),
++            eagain: 0,
++        });
++        assert!(
++            server
++                .inner
++                .audio
++                .try_send(Audio {
++                    session: first,
++                    stream: 1,
++                    sequence: 1,
++                    meta: meta(),
++                    samples: vec![7; 4],
++                    discontinuity: false,
++                })
++                .is_ok()
++        );
++        server.inner.audio_count.fetch_add(1, Ordering::AcqRel);
++        server.drain();
++        assert!(server.client.as_ref().unwrap().pending.is_none());
++        assert_eq!(server.inner.audio_count.load(Ordering::Acquire), 0);
++    }
++}
+--- /dev/null
++++ b/c2a/catplay_c2a/src/input_only.rs
+@@ -0,0 +1,65 @@
++use std::error::Error;
++
++use catplay_carplay::carplay_rx::sink::AirPlayServerShared;
++use catplay_carplay_rx_gadget::CarPlayWirelessGadget;
++use catplay_util::{EventReconciler, EventSleeper, EventToken, Reconciler};
++
++use crate::{AppConfig, HomeKitManager, MediaTap, MfiManager, PreviewRxSession, TelemetrySnapshot};
++
++/// Owns only the wireless receiver reconciler. There is intentionally no
++/// `ProdGadget`, `CarPlayOutputManager`, TX adapter, UDC, or configfs field in
++/// this runtime.
++pub struct InputOnlyManager {
++    receiver: Reconciler<CarPlayWirelessGadget<PreviewRxSession>>,
++}
++
++impl InputOnlyManager {
++    pub fn start(config: &AppConfig, mfi: &MfiManager, homekit: &HomeKitManager, media: MediaTap) -> Result<Self, Box<dyn Error>> {
++        if !config.bluetooth.enabled || config.bluetooth.device.trim().is_empty() {
++            return Err("input-only wireless receiver requires an enabled Bluetooth HCI device".into());
++        }
++        if !config.wifi.enabled || config.wifi.device.trim().is_empty() {
++            return Err("input-only wireless receiver requires the configured AP interface".into());
++        }
++        let homekit_rx = homekit
++            .homekit_rx
++            .clone()
++            .ok_or_else(|| std::io::Error::other("HomeKit RX storage was not initialized"))?;
++        let shared = AirPlayServerShared::new();
++        let mut receiver = CarPlayWirelessGadget::new(
++            homekit_rx,
++            Some(mfi.get_device()),
++            shared,
++            &config.bluetooth.name,
++            &config.bluetooth.device,
++            &config.wifi.device,
++            &config.wifi_network.ssid,
++            Some(&config.wifi_network.password),
++            config.wifi_network.wpa,
++            config.wifi_network.channel,
++            // The preview mode is deliberately stateless with respect to
++            // Bluetooth reconnect invitations; it only accepts live discovery.
++            None,
++            move || PreviewRxSession::new(media.clone()),
++        );
++        // Explicitly retain the gadget's invite-enabled default. In normal
++        // bridge mode this is gated by a car TX session; input-only has none.
++        receiver.child_mut().set_invites_blocked(false);
++        Ok(Self { receiver })
++    }
++
++    pub async fn reconcile(&mut self) {
++        let _ = self.receiver.reconcile().await;
++    }
++
++    pub async fn sleep(&mut self) -> Option<EventToken> {
++        self.receiver.sleep().await
++    }
++
++    pub fn telemetry_snapshot(&mut self) -> TelemetrySnapshot {
++        match self.receiver.state() {
++            Ok(state) => TelemetrySnapshot::from_input_only_wireless_state(Some(state)),
++            Err(_) => TelemetrySnapshot::input_only_error(),
++        }
++    }
++}
+--- /dev/null
++++ b/c2a/catplay_c2a/src/preview_rx.rs
+@@ -0,0 +1,767 @@
++use std::{
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
++    thread,
++    time::{Duration, Instant},
++};
++
++use async_trait::async_trait;
++use catplay_carplay::{
++    audio::{
++        AudioCodec, AudioFormatFlags, AudioPlayer, AudioPlayerBox, AudioRecorder, AudioRecorderBox, AudioSinkBox, AudioSource,
++        AudioSourceBox, AudioStreamBasicDescription,
++    },
++    carplay_rx::{AirPlayReceiverHandleRef, AirPlayReceiverSink},
++    msg::{AudioFormat, AudioType, Command, ControllerFeature, Display, DisplayFeature, DisplaySafeArea, DisplayViewArea, HidDevice, InfoMessageResponse, PrimaryInputDevice, StreamType},
++    rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
++    screen::rx::{ScreenReceiverSink, ScreenReceiverSinkBox},
++    video::{AvccConfigExtended, EncodedVideoFrame},
++};
++use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
++use log::warn;
++
++use crate::{
++    MediaTap,
++    display_config::{DisplayConfig, ScreenOffer, load_display_config},
++    media_ipc::{AudioMeta, AudioTap, VideoRole, VideoTap},
++};
++
++/// Input-only PCM is sampled at 10 ms intervals. At the supported maximum of
++/// 48 kHz stereo this is exactly 960 signed 16-bit samples, so the worker never
++/// allocates an audio buffer based on a peer-provided size.
++const PREVIEW_PCM_CADENCE: Duration = Duration::from_millis(10);
++const MAX_PREVIEW_PCM_SAMPLES: usize = 48_000 / 100 * 2;
++const MAIN_DISPLAY_UUID: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001080";
++const ALT_DISPLAY_UUID: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001081";
++const ALT_MAP_URL: &str = "maps:/car/instrumentcluster/map";
++pub(crate) const TOUCH_HID_UUID: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001082";
++
++/// Standard single-contact digitizer descriptor. The matching input report is
++/// exactly six bytes: transducer index, touch bit + padding, X LE, Y LE.
++pub(crate) fn touch_hid_device(width: u32, height: u32) -> HidDevice {
++    let x_max = width.saturating_sub(1).min(u16::MAX as u32) as u16;
++    let y_max = height.saturating_sub(1).min(u16::MAX as u32) as u16;
++    let mut descriptor = vec![
++        0x05, 0x0d, 0x09, 0x04, 0xa1, 0x01, // Digitizer / Touch Screen / Application
++        0x09, 0x22, 0xa1, 0x02, // Finger / Logical
++        0x09, 0x38, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, // Transducer index, 8 bits
++        0x15, 0x00, 0x25, 0x01, 0x09, 0x33, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, // Touch
++        0x95, 0x07, 0x81, 0x03, // Padding
++        0x05, 0x01, 0x26,
++    ];
++    descriptor.extend_from_slice(&x_max.to_le_bytes());
++    descriptor.extend_from_slice(&[0x09, 0x30, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02, 0x26]);
++    descriptor.extend_from_slice(&y_max.to_le_bytes());
++    descriptor.extend_from_slice(&[0x09, 0x31, 0x81, 0x02, 0xc0, 0xc0]);
++    HidDevice {
++        display_uuid: MAIN_DISPLAY_UUID.into(),
++        hid_country_code: 0,
++        hid_descriptor: descriptor.into(),
++        hid_product_id: 1,
++        hid_vendor_id: 2,
++        name: "Zero2W CarPlay Touchscreen".into(),
++        uuid: TOUCH_HID_UUID.into(),
++    }
++}
++
++pub(crate) fn touch_report(down: bool, x: u16, y: u16) -> [u8; 6] {
++    [0, u8::from(down), x as u8, (x >> 8) as u8, y as u8, (y >> 8) as u8]
++}
++
++/// A standalone, receive-only CarPlay session.
++///
++/// This type deliberately has no vehicle, transmitter, HID, microphone, or
++/// secondary-display path. It supplies exactly one primary display and sends
++/// only phone-to-accessory H.264 and PCM playback data to the bounded CPMF tap.
++pub struct PreviewRxSession {
++    media: MediaTap,
++    handle: Option<AirPlayReceiverHandleRef>,
++    /// The epoch returned when this exact receiver owner began. Keeping it on
++    /// the owner prevents a delayed old Drop from clearing a newer session.
++    session_epoch: Option<u64>,
++    display_config: DisplayConfig,
++}
++
++impl PreviewRxSession {
++    pub fn new(media: MediaTap) -> Self {
++        Self {
++            media,
++            handle: None,
++            session_epoch: None,
++            display_config: DisplayConfig::default(),
++        }
++    }
++
++    fn finish_session(&mut self, reason: u32) {
++        self.handle.take();
++        if let Some(epoch) = self.session_epoch.take() {
++            self.media.end_session_for_epoch(epoch, reason);
++        }
++    }
++
++    fn pcm_samples_per_tick(pcm: AudioStreamBasicDescription) -> RtspResult<usize> {
++        if !matches!(pcm.sample_rate, 8_000 | 16_000 | 24_000 | 32_000 | 44_100 | 48_000)
++            || !matches!(pcm.channels_per_frame, 1 | 2)
++            || pcm.format != AudioCodec::LinearPcm
++            || !pcm.format_flags.contains(AudioFormatFlags::IS_SIGNED_INT)
++            || pcm.format_flags.intersects(AudioFormatFlags::IS_FLOAT | AudioFormatFlags::IS_NON_INTERLEAVED)
++            || pcm.bits_per_channel != 16
++            || pcm.bytes_per_frame != pcm.channels_per_frame * 2
++        {
++            return Err(RtspError::NotSupported);
++        }
++        let samples = (pcm.sample_rate as usize / 100).saturating_mul(pcm.channels_per_frame as usize);
++        if samples == 0 || samples > MAX_PREVIEW_PCM_SAMPLES {
++            return Err(RtspError::NotSupported);
++        }
++        Ok(samples)
++    }
++
++    #[cfg(test)]
++    fn test_begin_session(&mut self) -> u64 {
++        let epoch = self.media.test_begin_session();
++        self.session_epoch = Some(epoch);
++        epoch
++    }
++
++    fn has_session(&self) -> bool {
++        self.session_epoch.is_some()
++    }
++
++    fn display(offer: ScreenOffer, uuid: &str, stream_type: StreamType) -> Display {
++        Display {
++            stream_type,
++            features: if stream_type == StreamType::Screen { DisplayFeature::HIGHFI_TOUCH } else { DisplayFeature::empty() },
++            primary_input_device: (stream_type == StreamType::Screen).then_some(PrimaryInputDevice::TouchScreen),
++            max_fps: Some(offer.fps),
++            height_pixels: offer.height,
++            width_pixels: offer.width,
++            height_physical: (offer.height.saturating_mul(194) / 1080).max(1),
++            width_physical: (offer.width.saturating_mul(344) / 1920).max(1),
++            uuid: uuid.into(),
++            view_areas: vec![DisplayViewArea {
++                height_pixels: offer.height,
++                width_pixels: offer.width,
++                origin_x_pixels: 0,
++                origin_y_pixels: 0,
++                safe_area: Some(DisplaySafeArea {
++                    height_pixels: offer.height,
++                    width_pixels: offer.width,
++                    origin_x_pixels: 0,
++                    origin_y_pixels: 0,
++                }),
++            }],
++            initial_view_area: Some(0),
++            ..Display::default()
++        }
++    }
++
++    fn apply_display_config(info: &mut InfoMessageResponse, config: DisplayConfig) {
++        info.displays.clear();
++        info.displays.push(Self::display(config.main, MAIN_DISPLAY_UUID, StreamType::Screen));
++        if config.alt.enabled {
++            info.displays.push(Self::display(config.alt, ALT_DISPLAY_UUID, StreamType::AltScreen));
++        }
++    }
++}
++
++#[async_trait]
++impl AirPlayReceiverSink for PreviewRxSession {
++    fn init(&mut self, session: AirPlayReceiverHandleRef) -> RtspResult<()> {
++        self.handle = Some(session.clone());
++        self.session_epoch = Some(self.media.begin_session(session));
++        Ok(())
++    }
++
++    async fn on_initial_setup(&mut self) -> RtspResult<()> {
++        if !self.has_session() {
++            return Err(RtspError::UnexpectedState("preview session was not initialized".into()));
++        }
++        self.display_config = load_display_config().unwrap_or_else(|error| {
++            warn!("Rejected display configuration, using safe defaults: {error}");
++            DisplayConfig::default()
++        });
++        Ok(())
++    }
++
++    fn enabled_features(&self) -> Vec<ControllerFeature> {
++        let mut features = vec![ControllerFeature::ViewAreas];
++        if self.display_config.alt.enabled {
++            features.push(ControllerFeature::AltScreen);
++        }
++        features
++    }
++
++    async fn on_command_raw(&mut self, command: &Command) -> RtspResult<RtspResponse> {
++        match command {
++            Command::DuckAudio(value) => self.media.set_audio_gain_db(value.duration_ms, value.volume),
++            Command::UnduckAudio(value) => self.media.set_audio_gain_db(value.duration_ms, value.volume),
++            _ => {}
++        }
++        Ok(RtspResponse::new(None, HttpStatus::Ok))
++    }
++
++    async fn on_info(&mut self, info: &mut InfoMessageResponse) {
++        // Configuration is only an offer. Actual main/alt activity is derived
++        // later from independent RTSP/CPMF streams and is never inferred here.
++        let config = load_display_config().unwrap_or_else(|error| {
++            warn!("Rejected display configuration, using safe defaults: {error}");
++            DisplayConfig::default()
++        });
++        self.display_config = config;
++        Self::apply_display_config(info, config);
++        let touch = touch_hid_device(config.main.width, config.main.height);
++        self.media.set_touch_device(touch.clone());
++        info.hid_devices.clear();
++        info.hid_devices.push(touch);
++    }
++
++    async fn on_record(&mut self) -> RtspResult<()> {
++        let handle = self
++            .handle
++            .as_ref()
++            .ok_or_else(|| RtspError::UnexpectedState("preview session was not initialized".into()))?;
++        handle.request_ui_for_display(MAIN_DISPLAY_UUID, "");
++        handle.request_keyframe_for_display(MAIN_DISPLAY_UUID);
++        if self.display_config.alt.enabled {
++            handle.show_ui_for_display(ALT_DISPLAY_UUID, ALT_MAP_URL);
++            handle.request_keyframe_for_display(ALT_DISPLAY_UUID);
++        }
++        Ok(())
++    }
++
++    async fn open_screen(&mut self, _latency: Duration) -> RtspResult<ScreenReceiverSinkBox> {
++        if !self.has_session() {
++            return Err(RtspError::UnexpectedState("preview session was not initialized".into()));
++        }
++        if let Some(handle) = self.handle.as_ref() {
++            handle.request_ui_for_display(MAIN_DISPLAY_UUID, "");
++            handle.request_keyframe_for_display(MAIN_DISPLAY_UUID);
++        }
++        Ok(Box::new(PreviewScreen::new(self.media.video_stream(VideoRole::Main))))
++    }
++
++    async fn open_screen_for_display(
++        &mut self,
++        _latency: Duration,
++        stream_type: StreamType,
++        display_uuid: Option<&str>,
++    ) -> RtspResult<ScreenReceiverSinkBox> {
++        if !self.has_session() {
++            return Err(RtspError::UnexpectedState("preview session was not initialized".into()));
++        }
++        let role = match (stream_type, display_uuid) {
++            (StreamType::Screen, Some(ALT_DISPLAY_UUID)) | (StreamType::AltScreen, _) => VideoRole::Alt,
++            (StreamType::Screen, _) => VideoRole::Main,
++            _ => return Err(RtspError::NotSupported),
++        };
++        if role == VideoRole::Alt && !self.display_config.alt.enabled {
++            return Err(RtspError::NotSupported);
++        }
++        if matches!((role, display_uuid), (VideoRole::Main, Some(ALT_DISPLAY_UUID)) | (VideoRole::Alt, Some(MAIN_DISPLAY_UUID))) {
++            return Err(RtspError::NotSupported);
++        }
++        if let Some(handle) = self.handle.as_ref() {
++            match role {
++                VideoRole::Main => {
++                    handle.request_ui_for_display(MAIN_DISPLAY_UUID, "");
++                    handle.request_keyframe_for_display(MAIN_DISPLAY_UUID);
++                }
++                VideoRole::Alt => {
++                    handle.show_ui_for_display(ALT_DISPLAY_UUID, ALT_MAP_URL);
++                    handle.request_keyframe_for_display(ALT_DISPLAY_UUID);
++                }
++            }
++        }
++        Ok(Box::new(PreviewScreen::new(self.media.video_stream(role))))
++    }
++
++    async fn open_audio(
++        &mut self,
++        latency: Duration,
++        stream_type: StreamType,
++        audio_type: AudioType,
++        audio_format: AudioFormat,
++        pcm_format: AudioStreamBasicDescription,
++        duplex: bool,
++    ) -> RtspResult<AudioPlayerBox<i16>> {
++        if !self.has_session() {
++            return Err(RtspError::UnexpectedState("preview session was not initialized".into()));
++        }
++        // CarPlay may make MainAudio duplex when Maps/Siri speech recognition
++        // becomes active. The decoded phone-to-accessory side is still accepted
++        // here; open_microphone supplies a bounded silent evaluation source so
++        // rejecting an optional mic cannot tear down both display streams.
++        let samples_per_tick = Self::pcm_samples_per_tick(pcm_format)?;
++        let tap = self.media.audio_stream(AudioMeta {
++            stream_type,
++            audio_type,
++            audio_format,
++            pcm: pcm_format,
++            latency_us: latency.as_micros().min(u32::MAX as u128) as u32,
++            duplex,
++        });
++        Ok(Box::new(PreviewPcmPlayer::new(samples_per_tick, tap)))
++    }
++
++    async fn open_microphone(
++        &mut self,
++        _stream_type: StreamType,
++        _audio_type: AudioType,
++        pcm_format: AudioStreamBasicDescription,
++    ) -> RtspResult<AudioRecorderBox<i16>> {
++        let samples_per_tick = Self::pcm_samples_per_tick(pcm_format)?;
++        Ok(Box::new(PreviewSilenceRecorder::new(samples_per_tick)))
++    }
++}
++
++impl EventReconciler for PreviewRxSession {
++    type Error = RtspError;
++}
++
++impl EventSleeper for PreviewRxSession {}
++
++impl AsyncShutdown for PreviewRxSession {
++    async fn shutdown(&mut self) {
++        self.finish_session(1);
++    }
++}
++
++impl Drop for PreviewRxSession {
++    fn drop(&mut self) {
++        self.finish_session(1);
++    }
++}
++
++struct PreviewScreen {
++    video: VideoTap,
++}
++
++impl PreviewScreen {
++    fn new(video: VideoTap) -> Self {
++        Self { video }
++    }
++}
++
++#[async_trait]
++impl ScreenReceiverSink for PreviewScreen {
++    async fn init(&mut self) -> RtspResult<()> {
++        Ok(())
++    }
++
++    async fn set_avcc_config(&mut self, config: AvccConfigExtended) -> RtspResult<()> {
++        self.video.config(config);
++        Ok(())
++    }
++
++    async fn process_frame(&mut self, frame: EncodedVideoFrame) -> RtspResult<()> {
++        self.video.frame(&frame);
++        Ok(())
++    }
++}
++
++impl AsyncShutdown for PreviewScreen {}
++
++/// The PCM clock runs on one small-stack native thread per open output stream.
++/// Running it on CatPlay's busy current-thread Tokio executor with
++/// `MissedTickBehavior::Skip` permanently lost every delayed 10 ms tick. The
++/// RTP consumer then fell progressively behind the producer until its bounded
++/// ring overflowed and emitted silence. An absolute monotonic deadline here
++/// catches up rare scheduler delays instead of deleting audio time.
++struct PreviewPcmPlayer {
++    source: Option<AudioSourceBox<i16>>,
++    tap: Option<AudioTap>,
++    samples_per_tick: usize,
++    task: Option<thread::JoinHandle<()>>,
++    stop: Arc<AtomicBool>,
++}
++
++impl PreviewPcmPlayer {
++    fn new(samples_per_tick: usize, tap: AudioTap) -> Self {
++        Self {
++            source: None,
++            tap: Some(tap),
++            samples_per_tick,
++            task: None,
++            stop: Arc::new(AtomicBool::new(false)),
++        }
++    }
++
++    fn consume_once(source: &mut dyn AudioSource<Sample = i16>, tap: &AudioTap, samples_per_tick: usize) {
++        let mut samples = [0_i16; MAX_PREVIEW_PCM_SAMPLES];
++        source.read(&mut samples[..samples_per_tick]);
++        tap.samples(&samples[..samples_per_tick]);
++    }
++
++    fn stop_task(&mut self) {
++        self.stop.store(true, Ordering::Release);
++        if let Some(task) = self.task.take() {
++            let _ = task.join();
++        }
++        // Dropping an unstarted tap still emits a bounded AUDIO_END event.
++        self.tap.take();
++    }
++}
++
++impl AudioPlayer for PreviewPcmPlayer {
++    type Sample = i16;
++
++    fn init(&mut self, source: AudioSourceBox<Self::Sample>) -> RtspResult<()> {
++        self.source.replace(source);
++        Ok(())
++    }
++
++    fn start(&mut self) {
++        if self.task.is_some() {
++            return;
++        }
++        let (Some(mut source), Some(tap)) = (self.source.take(), self.tap.take()) else {
++            return;
++        };
++        let samples_per_tick = self.samples_per_tick;
++        let stop = self.stop.clone();
++        stop.store(false, Ordering::Release);
++        match thread::Builder::new()
++            .name("catplay-pcm".into())
++            .stack_size(128 * 1024)
++            .spawn(move || {
++                let mut deadline = Instant::now();
++                while !stop.load(Ordering::Acquire) {
++                    Self::consume_once(source.as_mut(), &tap, samples_per_tick);
++                    deadline += PREVIEW_PCM_CADENCE;
++                    let now = Instant::now();
++                    if deadline > now {
++                        thread::sleep(deadline - now);
++                    }
++                }
++            }) {
++            Ok(task) => self.task = Some(task),
++            Err(error) => warn!("Failed to start PCM clock: {error}"),
++        }
++    }
++
++    fn stop(&mut self, _drain: bool) {
++        self.stop_task();
++    }
++}
++
++impl Drop for PreviewPcmPlayer {
++    fn drop(&mut self) {
++        self.stop_task();
++    }
++}
++
++/// Evaluation-only microphone source. It writes bounded silence so an iPhone
++/// speech-recognition MainAudio SETUP can remain valid without claiming that a
++/// physical microphone is present. Replace this with the real capture source
++/// before reporting microphone support as active.
++struct PreviewSilenceRecorder {
++    sink: Option<AudioSinkBox<i16>>,
++    samples_per_tick: usize,
++    task: Option<thread::JoinHandle<()>>,
++    stop: Arc<AtomicBool>,
++}
++
++impl PreviewSilenceRecorder {
++    fn new(samples_per_tick: usize) -> Self {
++        Self {
++            sink: None,
++            samples_per_tick,
++            task: None,
++            stop: Arc::new(AtomicBool::new(false)),
++        }
++    }
++
++    fn stop_task(&mut self) {
++        self.stop.store(true, Ordering::Release);
++        if let Some(task) = self.task.take() {
++            let _ = task.join();
++        }
++        self.sink.take();
++    }
++}
++
++impl AudioRecorder for PreviewSilenceRecorder {
++    type Sample = i16;
++
++    fn init(&mut self, sink: AudioSinkBox<Self::Sample>) -> RtspResult<()> {
++        self.sink.replace(sink);
++        Ok(())
++    }
++
++    fn start(&mut self) {
++        if self.task.is_some() {
++            return;
++        }
++        let Some(mut sink) = self.sink.take() else {
++            return;
++        };
++        let samples_per_tick = self.samples_per_tick;
++        let stop = self.stop.clone();
++        stop.store(false, Ordering::Release);
++        match thread::Builder::new()
++            .name("catplay-mic-silence".into())
++            .stack_size(128 * 1024)
++            .spawn(move || {
++                let silence = [0_i16; MAX_PREVIEW_PCM_SAMPLES];
++                let mut deadline = Instant::now();
++                while !stop.load(Ordering::Acquire) {
++                    let writable = sink.writable().min(samples_per_tick);
++                    if writable != 0 {
++                        sink.write(&silence[..writable]);
++                    }
++                    deadline += PREVIEW_PCM_CADENCE;
++                    let now = Instant::now();
++                    if deadline > now {
++                        thread::sleep(deadline - now);
++                    }
++                }
++            }) {
++            Ok(task) => self.task = Some(task),
++            Err(error) => warn!("Failed to start silence microphone clock: {error}"),
++        }
++    }
++
++    fn stop(&mut self, _drain: bool) {
++        self.stop_task();
++    }
++}
++
++impl Drop for PreviewSilenceRecorder {
++    fn drop(&mut self) {
++        self.stop_task();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        sync::atomic::{AtomicUsize, Ordering},
++        time::Instant,
++    };
++
++    use bytes::BytesMut;
++    use catplay_carplay::{
++        audio::AudioSource,
++        video::{AvccConfig, Pts},
++    };
++
++    use super::*;
++
++    struct CountingSource(Arc<AtomicUsize>);
++    struct CountingSink(Arc<AtomicUsize>);
++
++    impl catplay_carplay::audio::AudioSink for CountingSink {
++        type Sample = i16;
++
++        fn writable(&mut self) -> usize {
++            MAX_PREVIEW_PCM_SAMPLES
++        }
++
++        fn write(&mut self, _slice: &[i16]) {
++            self.0.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    impl AudioSource for CountingSource {
++        type Sample = i16;
++
++        fn stat(&mut self) -> catplay_carplay::audio::RingStatsAudio {
++            panic!("preview test source is consumed through read only")
++        }
++
++        fn stat_raw(&mut self) -> catplay_carplay::audio::RingStats {
++            panic!("preview test source is consumed through read only")
++        }
++
++        fn read(&mut self, slice: &mut [i16]) -> bool {
++            self.0.fetch_add(1, Ordering::Relaxed);
++            slice.fill(7);
++            true
++        }
++    }
++
++    fn config() -> AvccConfigExtended {
++        AvccConfigExtended {
++            hevc: false,
++            avcc: AvccConfig {
++                nal_size_len: 4,
++                sps_pps: vec![0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0, 0, 0, 1, 0x68, 0xce],
++            },
++            video_latency: Duration::ZERO,
++            width: 640,
++            height: 480,
++            respect_timestamps: true,
++        }
++    }
++
++    fn frame() -> EncodedVideoFrame {
++        EncodedVideoFrame {
++            pts: Pts::from(Instant::now()),
++            width: 640,
++            height: 480,
++            data: BytesMut::from(&b"\x00\x00\x00\x01\x65"[..]),
++            config: None,
++            nal_offsets: None,
++            is_keyframe: Some(true),
++            header_buf: BytesMut::new(),
++            chacha_tag_buf: BytesMut::new(),
++        }
++    }
++
++    fn pcm() -> AudioStreamBasicDescription {
++        AudioStreamBasicDescription::fill_pcm(48_000, 16, 16, 2, false)
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn preview_reports_configured_main_and_optional_alt_display() {
++        let mut info = InfoMessageResponse::default();
++        PreviewRxSession::apply_display_config(&mut info, DisplayConfig::default());
++        assert_eq!(info.displays.len(), 1);
++        assert_eq!(info.displays[0].width_pixels, 1920);
++        assert_eq!(info.displays[0].height_pixels, 1080);
++        assert_eq!(info.displays[0].max_fps, Some(60));
++        assert_eq!(info.displays[0].uuid, MAIN_DISPLAY_UUID);
++        assert!(info.displays[0].features.contains(DisplayFeature::HIGHFI_TOUCH));
++        assert_eq!(info.displays[0].primary_input_device, Some(PrimaryInputDevice::TouchScreen));
++        let touch = touch_hid_device(1920, 1080);
++        assert_eq!(touch.display_uuid, MAIN_DISPLAY_UUID);
++        assert_eq!(touch.uuid, TOUCH_HID_UUID);
++        assert_eq!(touch_report(true, 1919, 1079), [0, 1, 0x7f, 0x07, 0x37, 0x04]);
++        assert_eq!(touch_report(false, 10, 20), [0, 0, 10, 0, 20, 0]);
++
++        let configured = DisplayConfig {
++            main: ScreenOffer { enabled: true, width: 1280, height: 720, fps: 50 },
++            alt: ScreenOffer { enabled: true, width: 800, height: 480, fps: 25 },
++        };
++        PreviewRxSession::apply_display_config(&mut info, configured);
++        assert_eq!(info.displays.len(), 2);
++        assert_eq!((info.displays[0].width_pixels, info.displays[0].height_pixels, info.displays[0].max_fps), (1280, 720, Some(50)));
++        assert_eq!((info.displays[1].width_pixels, info.displays[1].height_pixels, info.displays[1].max_fps), (800, 480, Some(25)));
++        assert_eq!(info.displays[1].uuid, ALT_DISPLAY_UUID);
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn protocol_duck_and_unduck_are_forwarded_to_the_media_sink() {
++        let tap = MediaTap::test_tap();
++        tap.test_set_connected(true);
++        let mut session = PreviewRxSession::new(tap.clone());
++        session.test_begin_session();
++        let before = tap.test_queue_counts().0;
++        session
++            .on_command_raw(&Command::DuckAudio(catplay_carplay::msg::CommandDuckAudio { duration_ms: 300.0, volume: -12.0 }))
++            .await
++            .unwrap();
++        session
++            .on_command_raw(&Command::UnduckAudio(catplay_carplay::msg::CommandUnduckAudio { duration_ms: 600.0, volume: 0.0 }))
++            .await
++            .unwrap();
++        assert_eq!(tap.test_queue_counts().0, before + 2);
++    }
++
++    #[test]
++    fn pcm_clock_does_not_run_before_start_or_skip_while_executor_is_busy() {
++        let tap = MediaTap::test_tap();
++        tap.test_set_connected(true);
++        tap.test_begin_session();
++        let audio_tap = tap.audio_stream(AudioMeta {
++            stream_type: StreamType::MainAudio,
++            audio_type: AudioType::Media,
++            audio_format: AudioFormat::PCM_48000_STEREO,
++            pcm: pcm(),
++            latency_us: 0,
++            duplex: false,
++        });
++        let count = Arc::new(AtomicUsize::new(0));
++        let mut player = PreviewPcmPlayer::new(MAX_PREVIEW_PCM_SAMPLES, audio_tap);
++        player.init(Box::new(CountingSource(count.clone()))).unwrap();
++        thread::sleep(Duration::from_millis(30));
++        assert_eq!(count.load(Ordering::Relaxed), 0, "init must respect the RTP latency gate");
++        player.start();
++        thread::sleep(Duration::from_millis(125));
++        player.stop(false);
++        assert!(count.load(Ordering::Relaxed) >= 11, "native PCM clock must retain delayed 10 ms ticks");
++    }
++
++    #[test]
++    fn silence_microphone_clock_does_not_skip_timing_ticks() {
++        let count = Arc::new(AtomicUsize::new(0));
++        let mut recorder = PreviewSilenceRecorder::new(MAX_PREVIEW_PCM_SAMPLES);
++        recorder.init(Box::new(CountingSink(count.clone()))).unwrap();
++        thread::sleep(Duration::from_millis(30));
++        assert_eq!(count.load(Ordering::Relaxed), 0, "init must not transmit microphone samples");
++        recorder.start();
++        thread::sleep(Duration::from_millis(125));
++        recorder.stop(false);
++        assert!(count.load(Ordering::Relaxed) >= 11, "silence microphone clock must retain delayed 10 ms ticks");
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn h264_and_pcm_forwarding_are_bounded_and_teardown_clears_media() {
++        let tap = MediaTap::test_tap();
++        tap.test_set_connected(true);
++        tap.test_begin_session();
++
++        let mut screen = PreviewScreen::new(tap.video_stream(VideoRole::Main));
++        screen.set_avcc_config(config()).await.unwrap();
++        for _ in 0..16 {
++            screen.process_frame(frame()).await.unwrap();
++        }
++        let (control, video, audio) = tap.test_queue_counts();
++        assert!(control <= 16);
++        assert!(video <= 8, "dual-screen video queue must remain fixed at eight frames");
++        assert_eq!(audio, 0);
++
++        let audio_tap = tap.audio_stream(AudioMeta {
++            stream_type: StreamType::MainAudio,
++            audio_type: AudioType::Media,
++            audio_format: AudioFormat::PCM_48000_STEREO,
++            pcm: pcm(),
++            latency_us: 0,
++            duplex: false,
++        });
++        let mut source = CountingSource(Arc::new(AtomicUsize::new(0)));
++        PreviewPcmPlayer::consume_once(&mut source, &audio_tap, MAX_PREVIEW_PCM_SAMPLES);
++        for _ in 0..16 {
++            PreviewPcmPlayer::consume_once(&mut source, &audio_tap, MAX_PREVIEW_PCM_SAMPLES);
++        }
++        assert!(source.0.load(Ordering::Relaxed) > 0);
++        assert!(tap.test_queue_counts().2 <= 32, "dual-stream audio queue must remain fixed at thirty-two chunks");
++
++        drop(audio_tap);
++        drop(screen);
++        tap.end_session(1);
++        assert_eq!(tap.test_active_session(), 0);
++        assert!(tap.test_queue_counts().0 <= 16, "teardown control remains bounded");
++    }
++
++    #[test]
++    fn delayed_preview_drop_cannot_end_a_newer_media_epoch() {
++        let tap = MediaTap::test_tap();
++        let mut old_preview = PreviewRxSession::new(tap.clone());
++        let first = old_preview.test_begin_session();
++        let mut newer_preview = PreviewRxSession::new(tap.clone());
++        let second = newer_preview.test_begin_session();
++        assert_ne!(first, second);
++        assert_eq!(tap.test_active_session(), second);
++
++        // This is the production owner path: old Drop has only its own epoch.
++        drop(old_preview);
++        assert_eq!(tap.test_active_session(), second);
++        drop(newer_preview);
++        assert_eq!(tap.test_active_session(), 0);
++    }
++
++    #[test]
++    fn negotiated_pcm_and_silent_microphone_are_fixed_capacity() {
++        assert_eq!(PreviewRxSession::pcm_samples_per_tick(pcm()).unwrap(), MAX_PREVIEW_PCM_SAMPLES);
++        let mut unsupported = pcm();
++        unsupported.channels_per_frame = 3;
++        assert!(matches!(
++            PreviewRxSession::pcm_samples_per_tick(unsupported),
++            Err(RtspError::NotSupported)
++        ));
++    }
++}
+--- /dev/null
++++ b/c2a/catplay_c2a/src/display_config.rs
+@@ -0,0 +1,186 @@
++use std::{collections::BTreeMap, fs, path::Path};
++
++const DEFAULT_PATH: &str = "/tmp/zero2w-carplay-display.conf";
++const MAX_BYTES: u64 = 512;
++const MAX_TOTAL_PIXEL_RATE: u64 = 250_000_000;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct ScreenOffer {
++    pub enabled: bool,
++    pub width: u32,
++    pub height: u32,
++    pub fps: u32,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct DisplayConfig {
++    pub main: ScreenOffer,
++    pub alt: ScreenOffer,
++}
++
++impl Default for DisplayConfig {
++    fn default() -> Self {
++        Self {
++            main: ScreenOffer {
++                enabled: true,
++                width: 1920,
++                height: 1080,
++                fps: 60,
++            },
++            alt: ScreenOffer {
++                enabled: false,
++                width: 1280,
++                height: 720,
++                fps: 30,
++            },
++        }
++    }
++}
++
++impl DisplayConfig {
++    fn validate(self) -> Result<Self, String> {
++        fn screen(name: &str, value: ScreenOffer) -> Result<(), String> {
++            if value.width < 320
++                || value.width > 2560
++                || value.height < 240
++                || value.height > 1440
++                || value.width % 2 != 0
++                || value.height % 2 != 0
++                || !(1..=60).contains(&value.fps)
++            {
++                return Err(format!("{name} must use even 320..2560 x 240..1440 dimensions and 1..60 fps"));
++            }
++            Ok(())
++        }
++        if !self.main.enabled {
++            return Err("main display cannot be disabled".into());
++        }
++        screen("main", self.main)?;
++        screen("alt", self.alt)?;
++        let mut rate = self.main.width as u64 * self.main.height as u64 * self.main.fps as u64;
++        if self.alt.enabled {
++            rate += self.alt.width as u64 * self.alt.height as u64 * self.alt.fps as u64;
++        }
++        if rate > MAX_TOTAL_PIXEL_RATE {
++            return Err("combined display pixel rate exceeds 250000000 pixels/s".into());
++        }
++        Ok(self)
++    }
++}
++
++fn parse_bool(value: &str) -> Result<bool, String> {
++    match value {
++        "0" => Ok(false),
++        "1" => Ok(true),
++        _ => Err("alt_enabled must be 0 or 1".into()),
++    }
++}
++
++fn take_u32(values: &mut BTreeMap<&str, &str>, key: &str) -> Result<u32, String> {
++    values
++        .remove(key)
++        .ok_or_else(|| format!("missing display config key {key}"))?
++        .parse::<u32>()
++        .map_err(|_| format!("display config key {key} is not an unsigned integer"))
++}
++
++fn parse(text: &str) -> Result<DisplayConfig, String> {
++    let mut values = BTreeMap::new();
++    for line in text.lines() {
++        if line.is_empty() {
++            return Err("empty line in display config".into());
++        }
++        let (key, value) = line.split_once('=').ok_or_else(|| "invalid display config line".to_string())?;
++        if key.is_empty() || value.is_empty() || values.insert(key, value).is_some() {
++            return Err("invalid or duplicate display config key".into());
++        }
++    }
++    if take_u32(&mut values, "version")? != 1 {
++        return Err("unsupported display config version".into());
++    }
++    let config = DisplayConfig {
++        main: ScreenOffer {
++            enabled: true,
++            width: take_u32(&mut values, "main_width")?,
++            height: take_u32(&mut values, "main_height")?,
++            fps: take_u32(&mut values, "main_fps")?,
++        },
++        alt: ScreenOffer {
++            enabled: parse_bool(values.remove("alt_enabled").ok_or_else(|| "missing display config key alt_enabled".to_string())?)?,
++            width: take_u32(&mut values, "alt_width")?,
++            height: take_u32(&mut values, "alt_height")?,
++            fps: take_u32(&mut values, "alt_fps")?,
++        },
++    };
++    if !values.is_empty() {
++        return Err("unknown display config key".into());
++    }
++    config.validate()
++}
++
++pub fn load_display_config() -> Result<DisplayConfig, String> {
++    let path = std::env::var_os("CATPLAY_DISPLAY_CONFIG")
++        .map(std::path::PathBuf::from)
++        .unwrap_or_else(|| DEFAULT_PATH.into());
++    load_path(&path)
++}
++
++fn load_path(path: &Path) -> Result<DisplayConfig, String> {
++    let metadata = match fs::metadata(path) {
++        Ok(value) => value,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DisplayConfig::default()),
++        Err(error) => return Err(format!("cannot stat display config: {error}")),
++    };
++    if metadata.len() > MAX_BYTES {
++        return Err("display config is too large".into());
++    }
++    let text = fs::read_to_string(path).map_err(|error| format!("cannot read display config: {error}"))?;
++    if text.len() as u64 > MAX_BYTES {
++        return Err("display config is too large".into());
++    }
++    parse(&text)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_bounded_dual_display_offer() {
++        let parsed =
++            parse("version=1\nmain_width=1280\nmain_height=720\nmain_fps=50\nalt_enabled=1\nalt_width=800\nalt_height=480\nalt_fps=25\n")
++                .unwrap();
++        assert_eq!(
++            parsed.main,
++            ScreenOffer {
++                enabled: true,
++                width: 1280,
++                height: 720,
++                fps: 50
++            }
++        );
++        assert_eq!(
++            parsed.alt,
++            ScreenOffer {
++                enabled: true,
++                width: 800,
++                height: 480,
++                fps: 25
++            }
++        );
++    }
++
++    #[test]
++    fn rejects_odd_or_excessive_offers() {
++        assert!(
++            parse("version=1\nmain_width=1279\nmain_height=720\nmain_fps=50\nalt_enabled=0\nalt_width=800\nalt_height=480\nalt_fps=25\n")
++                .is_err()
++        );
++        assert!(
++            parse(
++                "version=1\nmain_width=2560\nmain_height=1440\nmain_fps=60\nalt_enabled=1\nalt_width=2560\nalt_height=1440\nalt_fps=60\n"
++            )
++            .is_err()
++        );
++    }
++}
+--- a/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs
++++ b/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs
+@@ -11,7 +11,7 @@
+ use std::time::Duration;
+ use tokio::time::timeout;
+ 
+-use crate::media_ipc::{MediaTap, VideoTap};
++use crate::media_ipc::{MediaTap, VideoRole, VideoTap};
+ 
+ pub enum ScreenProxyOp {
+     IphoneConfig { config: AvccConfigExtended },
+@@ -24,7 +24,7 @@
+ impl ScreenProxy {
+     const FRAME_CONSUMED_TIMEOUT: Duration = Duration::from_millis(500);
+     pub fn new(handle: AirPlayReceiverHandleRef) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) { let channel=mpsc::unbounded(); (Self::with_channel(handle,channel.0),channel.1) }
+-    pub fn new_with_media(handle: AirPlayReceiverHandleRef, media: MediaTap) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) { let channel=mpsc::unbounded(); (Self::with_channel_media(handle,channel.0,Some(media.video_stream())),channel.1) }
++    pub fn new_with_media(handle: AirPlayReceiverHandleRef, media: MediaTap) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) { let channel=mpsc::unbounded(); (Self::with_channel_media(handle,channel.0,Some(media.video_stream(VideoRole::Main))),channel.1) }
+     pub fn with_channel(handle: AirPlayReceiverHandleRef, tx: mpsc::UnboundedSender<ScreenProxyOp>) -> Self { Self::with_channel_media(handle,tx,None) }
+     fn with_channel_media(handle: AirPlayReceiverHandleRef, tx: mpsc::UnboundedSender<ScreenProxyOp>, media: Option<VideoTap>) -> Self { let _=tx.unbounded_send(ScreenProxyOp::IphoneStreamStart { handle:handle.clone() }); Self { channel:tx,handle,media } }
+ }
+--- a/carplay/catplay_carplay/src/carplay_rx/receiver_api.rs
++++ b/carplay/catplay_carplay/src/carplay_rx/receiver_api.rs
+@@ -15,7 +15,7 @@
+     carplay_rx::sink::AirPlayServerShared,
+     clock::MediaClockBox,
+     modes::{AirPlayModeState, AppState, ChangeModes, Resource, ResourceConstraint, ResourceID, ResourceTransferPriority},
+-    msg::{AudioFormat, AudioType, Command, HidDevice, InfoMessageResponse, StreamType},
++    msg::{AudioFormat, AudioType, Command, ControllerFeature, HidDevice, InfoMessageResponse, StreamType},
+     rtp::RtpReceiverError,
+     rtsp_frame::{HttpStatus, RtspError, RtspFuture, RtspResponse, RtspResult},
+     screen::rx::ScreenReceiverSinkBox,
+@@ -82,11 +82,24 @@
+     /// Send raw iAP2 packet.
+     fn send_iap2(&self, csm: CsmPacketBox);
+ 
+-    /// Request keyframe after video decoder error (best-effort).
++    /// Request a keyframe after video decoder error (best-effort).
+     fn request_keyframe(&self);
++
++    /// Request a keyframe for one display (best-effort). Dual-display receivers
++    /// must use this form so a main request cannot be mistaken for AltScreen.
++    fn request_keyframe_for_display(&self, uuid: &str);
+ 
+     /// Request UI to be shown. Required after screen Untake, among other things.
+     fn request_ui(&self, url: &str);
++
++    /// Request UI on one display (best-effort).
++    fn request_ui_for_display(&self, uuid: &str, url: &str);
++
++    /// Explicitly activate UI on an alternate display (best-effort).
++    fn show_ui_for_display(&self, uuid: &str, url: &str);
++
++    /// Stop UI on an alternate display (best-effort).
++    fn stop_ui_for_display(&self, uuid: &str);
+ 
+     /// Request session termination due to unexpected state or user request.
+     ///
+@@ -175,6 +188,12 @@
+     /// Allows rejecting incoming sessions if Error is returned here.
+     async fn on_initial_setup(&mut self) -> RtspResult<()> {
+         Ok(())
++    }
++
++    /// Session features this receiver can actually service. The RTSP engine
++    /// intersects these with features offered by the controller.
++    fn enabled_features(&self) -> Vec<ControllerFeature> {
++        Vec::new()
+     }
+ 
+     /// Allows raw response to incoming AirPlay commands; this is called before additional convenience callbacks for given command, if any.
+@@ -212,6 +231,18 @@
+         Err(RtspError::NotSupported)
+     }
+ 
++    /// Open a main or alternate screen with the peer-provided display UUID.
++    /// Existing sinks retain the legacy one-screen behavior through the
++    /// default implementation; dual-screen sinks must override this method.
++    async fn open_screen_for_display(
++        &mut self,
++        latency: Duration,
++        _stream_type: StreamType,
++        _display_uuid: Option<&str>,
++    ) -> RtspResult<ScreenReceiverSinkBox> {
++        self.open_screen(latency).await
++    }
++
+     /// Open microphone recorder sink for PCM-encoded audio (for example, ALSA).
+     async fn open_microphone(
+         &mut self,
+--- a/carplay/catplay_carplay/src/carplay_rx/sink/receiver.rs
++++ b/carplay/catplay_carplay/src/carplay_rx/sink/receiver.rs
+@@ -127,6 +127,10 @@
+     #[shutdown(take)]
+     // #[reconcile(AirPlayReceiverSessionError::Screen)]
+     screen: Option<TcpHelper<ScreenReceiverSession>>,
++    #[sleep]
++    #[shutdown(take)]
++    // Alternate screen is intentionally independent from the main stream.
++    alt_screen: Option<TcpHelper<ScreenReceiverSession>>,
+     #[shutdown(take)]
+     #[sleep]
+     #[reconcile(AirPlayReceiverSessionError::Rtp)]
+@@ -482,6 +486,12 @@
+                 }
+                 StreamType::Screen => {
+                     if let Some(mut screen) = self.streams.screen.take() {
++                        screen.shutdown().await;
++                        matched = true;
++                    }
++                }
++                StreamType::AltScreen => {
++                    if let Some(mut screen) = self.streams.alt_screen.take() {
+                         screen.shutdown().await;
+                         matched = true;
+                     }
+@@ -597,15 +607,25 @@
+     }
+ 
+     async fn setup_screen(&mut self, stream: StreamDescriptionScreen) -> RtspResult<StreamDescriptionResponse> {
+-        if self.streams.screen.is_some() {
+-            error!("Attempted to create video sink without TEARDOWN of previous one!");
++        let stream_type = stream.stream_type;
++        let occupied = match stream_type {
++            StreamType::Screen => self.streams.screen.is_some(),
++            StreamType::AltScreen => self.streams.alt_screen.is_some(),
++            _ => return Err(RtspError::Code(HttpStatus::NotAcceptable)),
++        };
++        if occupied {
++            error!("Attempted to create {stream_type:?} sink without TEARDOWN of previous one!");
+             return Err(HttpStatus::BadRequest)?;
+         }
+ 
+-        info!("Opening screen stream with latency {:?}", stream.latency_ms);
++        info!("Opening {stream_type:?} stream with latency {:?} and display UUID {:?}", stream.latency_ms, stream.uuid);
+ 
+         let latency = Duration::from_millis(stream.latency_ms.unwrap_or(0));
+-        let mut screen_sink = match self.sink.open_screen(latency).await {
++        let mut screen_sink = match self
++            .sink
++            .open_screen_for_display(latency, stream_type, stream.uuid.as_deref())
++            .await
++        {
+             Ok(sink) => sink,
+             Err(err) => {
+                 error!("Failed to open video sink: {err}");
+@@ -634,9 +654,13 @@
+         );
+ 
+         let (helper, local) = TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv)?;
+-        self.streams.screen.replace(helper);
+-
+-        let resp = StreamDescriptionResponseScreen::new(local.port());
++        match stream_type {
++            StreamType::Screen => self.streams.screen.replace(helper),
++            StreamType::AltScreen => self.streams.alt_screen.replace(helper),
++            _ => unreachable!(),
++        };
++
++        let resp = StreamDescriptionResponseScreen::new(local.port(), stream_type);
+         Ok(resp.into())
+     }
+ 
+@@ -871,12 +895,14 @@
+ 
+         let (keep_alive_socket, keep_alive_bind) = UdpHelper::bind(bind_ip, KeepAliveServer::new())?;
+ 
++        let mut enabled_features = self.sink.enabled_features();
++        enabled_features.retain(|feature| data.features.contains(feature));
+         let mut r = InitialSetupResponse {
+             event_port: events.unwrap_or(0),
+             keep_alive_port: Some(keep_alive_bind.port()),
+             streams: None,
+             timing_port: timing_bind.port(),
+-            enabled_features: vec![/*ControllerFeature::H264Level51*/],
++            enabled_features,
+         };
+ 
+         if self.features.contains(AirPlayFeature::CAR) && Self::CARPLAY_FORCE_HEVC {
+--- a/carplay/catplay_carplay/src/carplay_rx/sink/session_handle.rs
++++ b/carplay/catplay_carplay/src/carplay_rx/sink/session_handle.rs
+@@ -15,7 +15,7 @@
+     clock::{MediaClock, MediaClockBox, MediaClockProxy},
+     events::CommandsClient,
+     modes::{AirPlayModeState, AppState, ChangeModes, ChangeModesResponse, Resource},
+-    msg::{Command, CommandForceKeyFrame, CommandHidSendReport, CommandRequestUI, HidDevice},
++    msg::{Command, CommandForceKeyFrame, CommandHidSendReport, CommandRequestUI, CommandShowUI, CommandStopUI, HidDevice},
+     rtsp_frame::{HttpStatus, RtspError, RtspFuture, RtspQueue, RtspResult},
+ };
+ 
+@@ -66,7 +66,29 @@
+                 "" => None,
+                 v => Some(v.into()),
+             },
+-        }));
++            uuid: None,
++        }));
++    }
++
++    fn request_ui_for_display(&self, uuid: &str, ui: &str) {
++        self.send_command_and_forget(Command::RequestUI(CommandRequestUI {
++            url: match ui {
++                "" => None,
++                v => Some(v.into()),
++            },
++            uuid: Some(uuid.into()),
++        }));
++    }
++
++    fn show_ui_for_display(&self, uuid: &str, ui: &str) {
++        self.send_command_and_forget(Command::ShowUI(CommandShowUI {
++            url: ui.into(),
++            uuid: uuid.into(),
++        }));
++    }
++
++    fn stop_ui_for_display(&self, uuid: &str) {
++        self.send_command_and_forget(Command::StopUI(CommandStopUI { uuid: uuid.into() }));
+     }
+ 
+     fn send_command(&self, cmd: Command) -> RtspResult<RtspFuture> {
+@@ -122,7 +144,13 @@
+     }
+ 
+     fn request_keyframe(&self) {
+-        self.send_command_and_forget(Command::ForceKeyFrame(CommandForceKeyFrame {}));
++        self.send_command_and_forget(Command::ForceKeyFrame(CommandForceKeyFrame { uuid: None }));
++    }
++
++    fn request_keyframe_for_display(&self, uuid: &str) {
++        self.send_command_and_forget(Command::ForceKeyFrame(CommandForceKeyFrame {
++            uuid: Some(uuid.into()),
++        }));
+     }
+ 
+     fn close(&self, err: RtspError) {
+--- a/carplay/catplay_carplay/src/msg/commands/command.rs
++++ b/carplay/catplay_carplay/src/msg/commands/command.rs
+@@ -9,7 +9,7 @@
+     msg::{
+         CommandDisableBluetooth, CommandDuckAudio, CommandForceKeyFrame, CommandHidSendReport, CommandHidSetInputMode,
+         CommandIApSendMessage, CommandModesChanged, CommandRequestSiri, CommandRequestUI, CommandSetLimitedUI, CommandSetNightMode,
+-        CommandType, CommandUnduckAudio,
++        CommandShowUI, CommandStopUI, CommandType, CommandUnduckAudio,
+     },
+     rtsp_frame::RtspString,
+ };
+@@ -29,6 +29,8 @@
+     HidSetInputMode(CommandHidSetInputMode),
+     RequestSiri(CommandRequestSiri),
+     RequestUI(CommandRequestUI),
++    ShowUI(CommandShowUI),
++    StopUI(CommandStopUI),
+     SetNightMode(CommandSetNightMode),
+     SetLimitedUI(CommandSetLimitedUI),
+ 
+@@ -48,6 +50,8 @@
+             Command::HidSetInputMode(_) => CommandType::HidSetInputMode,
+             Command::RequestSiri(_) => CommandType::RequestSiri,
+             Command::RequestUI(_) => CommandType::RequestUI,
++            Command::ShowUI(_) => CommandType::ShowUI,
++            Command::StopUI(_) => CommandType::StopUI,
+             Command::SetNightMode(_) => CommandType::SetNightMode,
+             Command::SetLimitedUI(_) => CommandType::SetLimitedUI,
+             Command::IApSendMessage(_) => CommandType::IApSendMessage,
+@@ -118,6 +122,8 @@
+             Command::HidSetInputMode(data) => map.serialize_entry("params", data)?,
+             Command::RequestSiri(data) => map.serialize_entry("params", data)?,
+             Command::RequestUI(data) => map.serialize_entry("params", data)?,
++            Command::ShowUI(data) => map.serialize_entry("params", data)?,
++            Command::StopUI(data) => map.serialize_entry("params", data)?,
+             Command::SetNightMode(data) => map.serialize_entry("params", data)?,
+             Command::SetLimitedUI(data) => map.serialize_entry("params", data)?,
+             Command::IApSendMessage(data) => map.serialize_entry("params", data)?,
+@@ -159,6 +165,8 @@
+             CommandType::HidSetInputMode => from_value(&from_nested(&mut map)?).map(Command::HidSetInputMode),
+             CommandType::RequestSiri => from_value(&from_nested(&mut map)?).map(Command::RequestSiri),
+             CommandType::RequestUI => from_value(&from_nested(&mut map)?).map(Command::RequestUI),
++            CommandType::ShowUI => from_value(&from_nested(&mut map)?).map(Command::ShowUI),
++            CommandType::StopUI => from_value(&from_nested(&mut map)?).map(Command::StopUI),
+             CommandType::SetNightMode => from_value(&from_nested(&mut map)?).map(Command::SetNightMode),
+             CommandType::SetLimitedUI => from_value(&from_nested(&mut map)?).map(Command::SetLimitedUI),
+             CommandType::IApSendMessage => from_value(&from_nested(&mut map)?).map(Command::IApSendMessage),
+@@ -202,6 +210,44 @@
+     }
+ 
+     #[test]
++    fn test_display_targeted_commands_keep_uuid() {
++        let force = Command::ForceKeyFrame(super::super::CommandForceKeyFrame {
++            uuid: Some("alt-display".into()),
++        });
++        let force_value = from_bytes::<Value>(&force.serialize().unwrap()).unwrap();
++        assert_eq!(
++            force_value.as_dictionary().unwrap()["params"].as_dictionary().unwrap()["uuid"].as_string(),
++            Some("alt-display")
++        );
++
++        let request = Command::RequestUI(super::super::CommandRequestUI {
++            url: Some("maps:/car/instrumentcluster/map".into()),
++            uuid: Some("alt-display".into()),
++        });
++        let request_value = from_bytes::<Value>(&request.serialize().unwrap()).unwrap();
++        let params = request_value.as_dictionary().unwrap()["params"].as_dictionary().unwrap();
++        assert_eq!(params["uuid"].as_string(), Some("alt-display"));
++        assert_eq!(params["url"].as_string(), Some("maps:/car/instrumentcluster/map"));
++
++        let show = Command::ShowUI(super::super::CommandShowUI {
++            url: "maps:/car/instrumentcluster/map".into(),
++            uuid: "alt-display".into(),
++        });
++        let show_value = from_bytes::<Value>(&show.serialize().unwrap()).unwrap();
++        let show_dict = show_value.as_dictionary().unwrap();
++        assert_eq!(show_dict["type"].as_string(), Some("showUI"));
++        let show_params = show_dict["params"].as_dictionary().unwrap();
++        assert_eq!(show_params["uuid"].as_string(), Some("alt-display"));
++        assert_eq!(show_params["url"].as_string(), Some("maps:/car/instrumentcluster/map"));
++
++        let stop = Command::StopUI(super::super::CommandStopUI {
++            uuid: "alt-display".into(),
++        });
++        let stop_value = from_bytes::<Value>(&stop.serialize().unwrap()).unwrap();
++        assert_eq!(stop_value.as_dictionary().unwrap()["type"].as_string(), Some("stopUI"));
++    }
++
++    #[test]
+     fn test_serialize_payload_direct_duck() {
+         let report = Command::DuckAudio(super::super::CommandDuckAudio {
+             duration_ms: 100.0,
+--- a/carplay/catplay_carplay/src/msg/commands/command_structs.rs
++++ b/carplay/catplay_carplay/src/msg/commands/command_structs.rs
+@@ -35,7 +35,10 @@
+ }
+ 
+ plist_struct! {
+-    pub struct CommandForceKeyFrame {}
++    pub struct CommandForceKeyFrame {
++        /// Display UUID. Required to disambiguate main and AltScreen streams.
++        pub uuid: Option<String>,
++    }
+ }
+ 
+ plist_struct! {
+@@ -91,6 +94,21 @@
+ plist_struct! {
+     pub struct CommandRequestUI {
+         pub url: Option<String>,
++        /// Display UUID. Required when more than one display is offered.
++        pub uuid: Option<String>,
++    }
++}
++
++plist_struct! {
++    pub struct CommandShowUI {
++        pub url: String,
++        pub uuid: String,
++    }
++}
++
++plist_struct! {
++    pub struct CommandStopUI {
++        pub uuid: String,
+     }
+ }
+ 
+--- a/carplay/catplay_carplay/src/msg/commands/command_types.rs
++++ b/carplay/catplay_carplay/src/msg/commands/command_types.rs
+@@ -19,6 +19,8 @@
+     HidSetInputMode,
+     RequestSiri,
+     RequestUI,
++    ShowUI,
++    StopUI,
+     SetNightMode,
+     SetLimitedUI,
+     IApSendMessage,
+@@ -62,6 +64,8 @@
+             "hidSetInputMode" => CommandType::HidSetInputMode,
+             "requestSiri" => CommandType::RequestSiri,
+             "requestUI" => CommandType::RequestUI,
++            "showUI" => CommandType::ShowUI,
++            "stopUI" => CommandType::StopUI,
+             "setNightMode" => CommandType::SetNightMode,
+             "setLimitedUI" => CommandType::SetLimitedUI,
+             "iAPSendMessage" => CommandType::IApSendMessage,
+@@ -85,6 +89,8 @@
+             CommandType::HidSetInputMode => "hidSetInputMode",
+             CommandType::RequestSiri => "requestSiri",
+             CommandType::RequestUI => "requestUI",
++            CommandType::ShowUI => "showUI",
++            CommandType::StopUI => "stopUI",
+             CommandType::SetNightMode => "setNightMode",
+             CommandType::SetLimitedUI => "setLimitedUI",
+             CommandType::IApSendMessage => "iAPSendMessage",
+@@ -106,6 +112,8 @@
+             | CommandType::HidSendReport
+             | CommandType::RequestSiri
+             | CommandType::RequestUI
++            | CommandType::ShowUI
++            | CommandType::StopUI
+             | CommandType::SetNightMode
+             | CommandType::SetLimitedUI => CommandDirection::FromAccessory,
+ 
+--- a/carplay/catplay_carplay/src/msg/info.rs
++++ b/carplay/catplay_carplay/src/msg/info.rs
+@@ -114,8 +114,29 @@
+ }
+ 
+ plist_struct! {
++    pub struct DisplaySafeArea {
++        pub height_pixels: u32,
++        pub width_pixels: u32,
++        pub origin_x_pixels: u32,
++        pub origin_y_pixels: u32,
++    }
++}
++
++plist_struct! {
++    pub struct DisplayViewArea {
++        pub height_pixels: u32,
++        pub width_pixels: u32,
++        pub origin_x_pixels: u32,
++        pub origin_y_pixels: u32,
++        pub safe_area: Option<DisplaySafeArea>,
++    }
++}
++
++plist_struct! {
+     pub struct Display {
+         pub edid: Option<PlistByteArray>,
++        #[serde(rename = "type")]
++        pub stream_type: StreamType,
+         pub features: DisplayFeature,
+         #[serde(rename = "maxFPS")]
+         pub max_fps: Option<u32>,
+@@ -124,6 +145,10 @@
+         pub height_physical: u32,
+         pub width_physical: u32,
+         pub uuid: String,
++        #[serde(default)]
++        pub view_areas: Vec<DisplayViewArea>,
++        pub initial_view_area: Option<u32>,
++        pub initial_url: Option<String>,
+         /// Absent in v210.81
+         pub primary_input_device: Option<PrimaryInputDevice>,
+     }
+--- a/carplay/catplay_carplay/src/msg/stream_desc.rs
++++ b/carplay/catplay_carplay/src/msg/stream_desc.rs
+@@ -248,11 +248,8 @@
+ }
+ 
+ impl StreamDescriptionResponseScreen {
+-    pub fn new(data_port: u16) -> Self {
+-        Self {
+-            data_port,
+-            stream_type: StreamType::Screen,
+-        }
++    pub fn new(data_port: u16, stream_type: StreamType) -> Self {
++        Self { data_port, stream_type }
+     }
+ }
+ 
+--- a/carplay/catplay_carplay/src/msg/streams.rs
++++ b/carplay/catplay_carplay/src/msg/streams.rs
+@@ -12,12 +12,12 @@
+         AltAudio = 101,
+         MainHighAudio = 102,
+         Screen = 110,
++        AltScreen = 111,
+ 
+         // Modern CarPlay
+         /*BufferedAudio = 103,
+         AuxOutAudio = 106,
+         AuxInAudio = 107,
+-        AltScreen = 111,
+         MainAudioWithRedundancy = 104,
+         AltAudioWithRedundancy = 105,
+         AuxOutAudioWithRedundancy = 108,
+--- a/core/catplay_mfi/src/mfi_device_i2c.rs
++++ b/core/catplay_mfi/src/mfi_device_i2c.rs
+@@ -1,87 +1,64 @@
+ use log::debug;
+ use std::fs::{File, OpenOptions};
+ use std::io;
+-use std::os::fd::{AsRawFd, RawFd};
++use std::os::fd::AsRawFd;
+ use std::sync::Mutex;
+ use std::thread::sleep;
+ use std::time::{Duration, Instant};
+ 
+ use crate::{MfiDevice, MfiI2cError, MfiResult};
+ 
+-const I2C_RDWR: libc::Ioctl = 0x0707;
+-const I2C_M_RD: u16 = 0x0001;
++const I2C_SLAVE: libc::Ioctl = 0x0703;
+ const RETRY_DELAY_US: u64 = 5_000; // 5 ms
++const SELECT_DELAY_US: u64 = 2_000; // tIDLE after register selector STOP
++const CERT_SELECT_DELAY_US: u64 = 12_000; // tCERT max 10 ms plus tIDLE
+ const DEADLINE: Duration = Duration::from_secs(2);
+-
+-#[repr(C)]
+-struct I2cMessage {
+-    addr: u16,
+-    flags: u16,
+-    len: u16,
+-    buf: *mut u8,
+-}
+-
+-#[repr(C)]
+-struct I2cRdwrData {
+-    msgs: *mut I2cMessage,
+-    nmsgs: u32,
+-}
+-
+-fn checked_i2c_len(len: usize) -> io::Result<u16> {
+-    u16::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "I2C message exceeds 65535 bytes"))
+-}
+-
+-fn transfer(fd: RawFd, messages: &mut [I2cMessage]) -> io::Result<()> {
+-    let mut data = I2cRdwrData {
+-        msgs: messages.as_mut_ptr(),
+-        nmsgs: u32::try_from(messages.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many I2C messages"))?,
+-    };
+-
+-    // SAFETY: data points to messages valid for this call, and every message buffer
+-    // remains alive and writable as indicated by its flags until ioctl returns.
+-    let result = unsafe { libc::ioctl(fd, I2C_RDWR, &mut data) };
++const AUTH_STATUS_ERROR: u8 = 0x80;
++const AUTH_STATUS_STATE_MASK: u8 = 0x70;
++const AUTH_STATUS_COMPLETE: u8 = 0x10;
++const DEVICE_VERSION_REGISTER: u8 = 0x00;
++const EXPECTED_DEVICE_VERSION: u8 = 0x07;
++
++fn auth_status_complete(status: u8) -> bool {
++    status & AUTH_STATUS_STATE_MASK == AUTH_STATUS_COMPLETE
++}
++
++fn wake_i2c(i2c: &mut File, dev_addr: u8) -> MfiResult<()> {
++    // Auth 3.0 may enter sleep between CarPlay attempts.  Match the proven
++    // board flow: issue a register selector as a wake pulse, wait one retry
++    // interval, then require the expected device-version response.
++    let _ = write_transaction(i2c, &[DEVICE_VERSION_REGISTER]);
++    sleep(Duration::from_micros(RETRY_DELAY_US));
++    let version = read_i2c(i2c, dev_addr, DEVICE_VERSION_REGISTER, 1)?[0];
++    if version != EXPECTED_DEVICE_VERSION {
++        return Err(MfiI2cError::Other(format!("unexpected MFI device version 0x{version:02X}")));
++    }
++    Ok(())
++}
++
++fn write_transaction(file: &File, data: &[u8]) -> io::Result<()> {
++    let result = unsafe { libc::write(file.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+     if result < 0 {
+         return Err(io::Error::last_os_error());
+     }
+-    if result as usize != messages.len() {
+-        return Err(io::Error::other(format!(
+-            "incomplete I2C transfer: {result}/{} messages",
+-            messages.len()
+-        )));
+-    }
+-
++    if result as usize != data.len() {
++        return Err(io::Error::new(io::ErrorKind::WriteZero, "short I2C write"));
++    }
+     Ok(())
+ }
+ 
+-fn write_transaction(file: &File, dev_addr: u8, data: &[u8]) -> io::Result<()> {
+-    let mut message = I2cMessage {
+-        addr: u16::from(dev_addr),
+-        flags: 0,
+-        len: checked_i2c_len(data.len())?,
+-        buf: data.as_ptr().cast_mut(),
+-    };
+-    transfer(file.as_raw_fd(), std::slice::from_mut(&mut message))
+-}
+-
+-fn write_read_transaction(file: &File, dev_addr: u8, write: &[u8], read: &mut [u8]) -> io::Result<()> {
+-    let mut messages = [
+-        I2cMessage {
+-            addr: u16::from(dev_addr),
+-            flags: 0,
+-            len: checked_i2c_len(write.len())?,
+-            buf: write.as_ptr().cast_mut(),
+-        },
+-        I2cMessage {
+-            addr: u16::from(dev_addr),
+-            flags: I2C_M_RD,
+-            len: checked_i2c_len(read.len())?,
+-            buf: read.as_mut_ptr(),
+-        },
+-    ];
+-    transfer(file.as_raw_fd(), &mut messages)
+-}
+-
+-fn read_i2c(i2c: &mut File, dev_addr: u8, addr: u8, n: usize) -> MfiResult<Vec<u8>> {
++fn read_transaction(file: &File, data: &mut [u8]) -> io::Result<()> {
++    let result = unsafe { libc::read(file.as_raw_fd(), data.as_mut_ptr().cast(), data.len()) };
++    if result < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if result as usize != data.len() {
++        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short I2C read"));
++    }
++    Ok(())
++}
++
++fn read_i2c_with_select_delay(i2c: &mut File, addr: u8, n: usize, select_delay: Duration) -> MfiResult<Vec<u8>> {
+     let deadline = Instant::now() + DEADLINE;
+     let mut buf = vec![0u8; n];
+     let mut tries = 0;
+@@ -90,7 +67,13 @@
+ 
+     loop {
+         tries += 1;
+-        match write_read_transaction(i2c, dev_addr, &[addr], &mut buf) {
++        let result = write_transaction(i2c, &[addr]).and_then(|_| {
++            // Auth 3.0 requires a STOP followed by tIDLE before the read.
++            // Without this delay the board returns ENXIO on every read.
++            sleep(select_delay);
++            read_transaction(i2c, &mut buf)
++        });
++        match result {
+             Ok(_) => {
+                 debug!("read_i2c 0x{addr:02X} OK after {tries} tries");
+                 return Ok(buf);
+@@ -111,7 +94,11 @@
+     }
+ }
+ 
+-fn write_i2c(i2c: &mut File, dev_addr: u8, addr: u8, data: &[u8]) -> MfiResult<()> {
++fn read_i2c(i2c: &mut File, _dev_addr: u8, addr: u8, n: usize) -> MfiResult<Vec<u8>> {
++    read_i2c_with_select_delay(i2c, addr, n, Duration::from_micros(SELECT_DELAY_US))
++}
++
++fn write_i2c(i2c: &mut File, _dev_addr: u8, addr: u8, data: &[u8]) -> MfiResult<()> {
+     let mut tmp = Vec::with_capacity(1 + data.len());
+     tmp.push(addr);
+     tmp.extend_from_slice(data);
+@@ -120,7 +107,7 @@
+     let mut tries = 0;
+     loop {
+         tries += 1;
+-        match write_transaction(i2c, dev_addr, &tmp) {
++        match write_transaction(i2c, &tmp) {
+             Ok(_) => {
+                 debug!("write_i2c 0x{addr:02X} OK after {tries} tries");
+                 return Ok(());
+@@ -152,6 +139,10 @@
+ impl MfiDeviceI2C {
+     pub fn new(bus_offset: u32, dev_addr: u8) -> MfiResult<Self> {
+         let i2c_device = OpenOptions::new().read(true).write(true).open(format!("/dev/i2c-{bus_offset}"))?;
++        let result = unsafe { libc::ioctl(i2c_device.as_raw_fd(), I2C_SLAVE, libc::c_ulong::from(dev_addr)) };
++        if result < 0 {
++            return Err(MfiI2cError::Io(io::Error::last_os_error()));
++        }
+         let s = Self {
+             device: Mutex::new(i2c_device),
+             // bus_offset,
+@@ -171,11 +162,13 @@
+             return Ok(cached_cert.clone());
+         }
+ 
++        wake_i2c(&mut device, self.dev_addr)?;
++
+         let mut retries = 0;
+         let mut size;
+ 
+         loop {
+-            let len_bytes = read_i2c(&mut device, self.dev_addr, 0x30, 2)?;
++            let len_bytes = read_i2c_with_select_delay(&mut device, 0x30, 2, Duration::from_micros(CERT_SELECT_DELAY_US))?;
+             size = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+             retries += 1;
+ 
+@@ -201,36 +194,50 @@
+ 
+     pub fn i2c_generate_challenge_response(&self, challenge: &[u8]) -> MfiResult<Vec<u8>> {
+         let mut device = self.device.lock().unwrap();
++        wake_i2c(&mut device, self.dev_addr)?;
+         debug!("Challenge buf size: {}", challenge.len());
+ 
+-        // let mut buf = Vec::with_capacity(2 + challenge.len());
+-        // buf.extend_from_slice(&u16::to_be_bytes(challenge.len() as u16));
+-        // buf.extend_from_slice(challenge);
+-
+-        // write_i2c(&mut device, self.dev_addr, 0x20, &buf)?;
+-        write_i2c(&mut device, self.dev_addr, 0x20, &u16::to_be_bytes(challenge.len() as u16))?;
++        if challenge.len() != 32 {
++            return Err(MfiI2cError::UnexpectedSize(challenge.len()));
++        }
++
++        // Match the board-verified Auth 3.0 transaction sequence. Writing the
++        // challenge data updates register 0x20; writing 0x20 itself caused the
++        // coprocessor to retain a completed state with no response payload.
+         write_i2c(&mut device, self.dev_addr, 0x21, challenge)?;
+-
+-        // write_i2c(&mut device, self.dev_addr, 0x11, &u16::to_be_bytes(0x80))?;
++        let challenge_len = read_i2c(&mut device, self.dev_addr, 0x20, 2)?;
++        let challenge_size = u16::from_be_bytes([challenge_len[0], challenge_len[1]]) as usize;
++        if challenge_size != challenge.len() {
++            return Err(MfiI2cError::UnexpectedSize(challenge_size));
++        }
++
+         write_i2c(&mut device, self.dev_addr, 0x10, &[0x01])?;
+ 
+-        sleep(Duration::from_millis(10));
+-
+-        let status = read_i2c(&mut device, self.dev_addr, 0x10, 1)?;
+-        debug!("status {}", status[0]);
+-        if (status[0] & 0x80) != 0 {
+-            let err_code = read_i2c(&mut device, self.dev_addr, 0x05, 1)?[0];
+-            return Err(MfiI2cError::SigningError {
+-                status: status[0],
+-                code: err_code,
+-            });
++        // Auth 3.0 signing is asynchronous.  A fixed delay is not sufficient
++        // on the Zero 2W: reading 0x11 before 0x10 reports the completed state
++        // returns a transient zero response length and tears down iAP2.
++        let auth_deadline = Instant::now() + DEADLINE;
++        loop {
++            sleep(Duration::from_micros(RETRY_DELAY_US));
++            let status = read_i2c(&mut device, self.dev_addr, 0x10, 1)?[0];
++            debug!("status {}", status);
++            if status & AUTH_STATUS_ERROR != 0 {
++                let err_code = read_i2c(&mut device, self.dev_addr, 0x05, 1)?[0];
++                return Err(MfiI2cError::SigningError { status, code: err_code });
++            }
++            if auth_status_complete(status) {
++                break;
++            }
++            if Instant::now() >= auth_deadline {
++                return Err(MfiI2cError::Other("MFI authentication calculation timed out".to_string()));
++            }
+         }
+ 
+         let len_bytes = read_i2c(&mut device, self.dev_addr, 0x11, 2)?;
+         let size = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+         debug!("Challenge response size is {}", size);
+ 
+-        if size == 0 || size > 0x80 {
++        if size != 64 {
+             return Err(MfiI2cError::UnexpectedSize(size));
+         }
+ 
+@@ -247,3 +254,16 @@
+         self.i2c_generate_challenge_response(challenge)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::auth_status_complete;
++
++    #[test]
++    fn auth_status_waits_until_signature_is_complete() {
++        assert!(!auth_status_complete(0x00));
++        assert!(!auth_status_complete(0x20));
++        assert!(auth_status_complete(0x10));
++        assert!(auth_status_complete(0x90));
++    }
++}

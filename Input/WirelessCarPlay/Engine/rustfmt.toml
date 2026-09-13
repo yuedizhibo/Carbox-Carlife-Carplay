@@ -1,0 +1,11 @@
+# Formatting for the real-CarPlay sidecar.
+#
+# Matches the dense style of this repository's C++20 core (whole classes on a
+# few lines) and the reference Rust project's own width
+# (Reference/CatPlaySource/rustfmt.toml uses max_width = 140, chain_width = 100), so
+# `cargo fmt --check` is a usable gate instead of a churn generator.
+# `use_small_heuristics = "Max"` keeps struct literals, short chains and
+# if/else expressions on one line up to max_width.
+max_width = 140
+chain_width = 100
+use_small_heuristics = "Max"

@@ -1,0 +1,15 @@
+[package]
+name = "cp-harness"
+description = "Portable safety, config, AP-plan and IPC framing logic for the Zero2W real-CarPlay sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "cp_harness"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

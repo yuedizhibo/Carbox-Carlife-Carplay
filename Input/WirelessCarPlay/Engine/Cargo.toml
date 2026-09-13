@@ -1,0 +1,27 @@
+# Headless native sidecar for the real Wireless-CarPlay path.
+#
+# This workspace is deliberately tiny: a portable policy/config library plus one
+# binary. No Electron, no Node, no JVM, no Python, no GStreamer, and no protocol
+# engine is compiled by default. Every queue and cache in here has a fixed cap.
+#
+# The GPL-3.0 logic ported from LIVI (see LICENSE-NOTICES.md) lives in
+# cp-harness::ap and runs in this process only. It never links into the C++20
+# core; the two exchange line-delimited JSON over a Unix socket.
+[workspace]
+resolver = "2"
+members = ["crates/cp-harness", "crates/cp-native"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "local:zero2w/Input/WirelessCarPlay/Engine"
+
+# Size-lean release profile, matching the posture of the C++20 core build.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

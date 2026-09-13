@@ -1,0 +1,548 @@
+--- a/c2a/catplay_c2a/src/lib.rs
++++ b/c2a/catplay_c2a/src/lib.rs
+@@ -7,6 +7,8 @@
+ mod input_only;
+ mod main_init;
+ mod media_ipc;
++mod control_ext;
++mod input_iap2;
+ mod mfi_manager;
+ mod preview_rx;
+ mod prod_gadget;
+--- a/c2a/catplay_c2a/src/media_ipc.rs
++++ b/c2a/catplay_c2a/src/media_ipc.rs
+@@ -109,6 +109,7 @@
+ }
+ 
+ enum Control {
++    Extension(u64, u16, [u32; 4], Vec<u8>),
+     SessionBegin(u64),
+     SessionEnd(u64, u32),
+     VideoStart(u64, u32, VideoRole),
+@@ -158,6 +159,12 @@
+ }
+ 
+ impl MediaTap {
++    pub(crate) fn extension(&self, epoch: u64, kind: u16, p: [u32; 4], bytes: Vec<u8>) {
++        let max = match kind { 0x30 => 768, 0x31 => 128 * 1024, 0x36 => 224, 0x3a | 0x48 => 0, _ => return };
++        if epoch != 0 && self.inner.session.load(Ordering::Acquire) == epoch && bytes.len() <= max {
++            self.control(Control::Extension(epoch, kind, p, bytes));
++        }
++    }
+     pub fn new() -> (MediaServer, Self) {
+         let (control, control_rx) = mpsc::sync_channel(CONTROL_CAP);
+         let (video, video_rx) = mpsc::sync_channel(VIDEO_CAP);
+@@ -345,6 +352,15 @@
+     }
+ 
+     #[cfg(test)]
++    pub(crate) fn test_pop_extension(&self) -> Option<(u16, [u32; 4], Vec<u8>)> {
++        while let Ok(event) = self.inner.control_rx.lock().unwrap().try_recv() {
++            self.inner.control_count.fetch_sub(1, Ordering::AcqRel);
++            if let Control::Extension(_, kind, p, bytes) = event { return Some((kind, p, bytes)); }
++        }
++        None
++    }
++
++    #[cfg(test)]
+     pub(crate) fn test_queue_counts(&self) -> (usize, usize, usize) {
+         (
+             self.inner.control_count.load(Ordering::Acquire),
+@@ -479,13 +495,16 @@
+     at: usize,
+     started: Instant,
+ }
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq)]
+ enum ClientRequest {
+     Keyframe { session: u64, stream: u32 },
+     Touch { session: u64, sequence: u64, phase: u32, x: u32, y: u32, role: u32 },
++    Extended { session: u64, sequence: u64, kind: u16, p: [u32; 4], payload: Vec<u8> },
+ }
+ #[derive(Default)]
+ struct Snapshot {
++    control_sequence: u64,
++    extensions: Vec<(u16, [u32; 4], Vec<u8>)>,
+     session: u64,
+     // stream, role, config id, SPS/PPS, width, height. Capacity is two.
+     video: Vec<(u32, VideoRole, u32, Vec<u8>, u32, u32)>,
+@@ -609,6 +628,16 @@
+     }
+     fn control_event(&mut self, e: Control) {
+         match e {
++            Control::Extension(epoch, kind, p, bytes) => {
++                if epoch == self.state.session && epoch != 0 {
++                    self.state.extensions.retain(|v| v.0 != kind);
++                    // Only five producer kinds are admitted by MediaTap::extension.
++                    if self.state.extensions.len() < 5 {
++                        self.state.extensions.push((kind, p, bytes.clone()));
++                        self.enqueue(record(kind, 0, epoch, 0, 0, 0, &bytes, p));
++                    }
++                }
++            }
+             Control::SessionBegin(id) => {
+                 self.state = Snapshot {
+                     session: id,
+@@ -755,13 +784,20 @@
+                 return;
+             };
+             let mut buf = [0; HEADER];
+-            match c.io.read(&mut buf) {
++            // Read exactly one bounded record, including partial/coalesced payloads.
++            let need = if c.read.len() < HEADER { HEADER - c.read.len() } else {
++                let size = u32be(&c.read[40..44]) as usize;
++                if size > crate::control_ext::MAX_PAYLOAD { self.close(); return; }
++                HEADER + size - c.read.len()
++            };
++            let offer = need.min(buf.len());
++            match c.io.read(&mut buf[..offer]) {
+                 Ok(0) => close = true,
+                 Ok(n) => {
+                     c.read.extend_from_slice(&buf[..n]);
+-                    if c.read.len() > HEADER {
++                    if c.read.len() >= HEADER && u32be(&c.read[40..44]) as usize > crate::control_ext::MAX_PAYLOAD {
+                         close = true;
+-                    } else if c.read.len() == HEADER {
++                    } else if c.read.len() >= HEADER && c.read.len() == HEADER + u32be(&c.read[40..44]) as usize {
+                         target = request_target(&c.read);
+                         close = target.is_none();
+                         if !close {
+@@ -801,6 +837,16 @@
+                     }
+                 }
+             }
++            Some(ClientRequest::Extended { session, sequence, kind, p, payload }) => {
++                if session != self.state.session || session == 0 || sequence <= self.state.control_sequence { return; }
++                self.state.control_sequence = sequence;
++                let (width, height) = self.state.video.iter().find(|v| v.1 == VideoRole::Main).map(|v| (v.4, v.5)).unwrap_or((0, 0));
++                if let Some(actions) = crate::control_ext::actions(kind, p, &payload, width, height) {
++                    let handle = self.inner.handle.lock().unwrap();
++                    let touch = self.inner.touch_device.lock().unwrap();
++                    if let Some(handle) = handle.as_ref() { crate::control_ext::dispatch(handle, touch.as_ref(), actions); }
++                }
++            }
+             None => {}
+         }
+     }
+@@ -832,6 +878,9 @@
+         let (duration, gain, generation) = self.state.audio_gain;
+         if generation != 0 {
+             self.enqueue(record(AUDIO_GAIN, 4, s, 0, 0, 0, &[], [duration, gain, 0, generation]));
++        }
++        for (kind, p, bytes) in self.state.extensions.clone() {
++            self.enqueue(record(kind, 4, s, 0, 0, 0, &bytes, p));
+         }
+     }
+ }
+@@ -873,10 +922,12 @@
+     [prefer_audio, !prefer_audio]
+ }
+ fn request_target(h: &[u8]) -> Option<ClientRequest> {
+-    if h.len() != HEADER || &h[..4] != b"CPMF" || h[4] != 1 || h[5] != 0 || u16be(&h[6..8]) != HEADER as u16
++    if h.len() < HEADER || &h[..4] != b"CPMF" || h[4] != 1 || h[5] != 0 || u16be(&h[6..8]) != HEADER as u16
+         || h[10..12].iter().any(|b| *b != 0) || h[60..64].iter().any(|b| *b != 0) {
+         return None;
+     }
++    let size = u32be(&h[40..44]) as usize;
++    if size > crate::control_ext::MAX_PAYLOAD || h.len() != HEADER + size { return None; }
+     let session = u64be(&h[16..24]);
+     match u16be(&h[8..10]) {
+         REQUEST_KEYFRAME if session != 0 && h[24..60].iter().all(|b| *b == 0) => Some(ClientRequest::Keyframe {
+@@ -893,6 +944,10 @@
+                 y: u32be(&h[52..56]),
+                 role: u32be(&h[56..60]),
+             })
++        }
++        kind @ 0x8010..=0x801f if session != 0 && u64be(&h[24..32]) != 0 && h[12..16] == [0; 4] && h[32..40] == [0; 8] => {
++            Some(ClientRequest::Extended { session, sequence: u64be(&h[24..32]), kind,
++                p: [u32be(&h[44..48]), u32be(&h[48..52]), u32be(&h[52..56]), u32be(&h[56..60])], payload: h[HEADER..].to_vec() })
+         }
+         _ => None,
+     }
+@@ -1271,6 +1326,30 @@
+         assert_eq!(request_target(&payload), None);
+     }
+     #[test]
++    fn extended_payload_partial_coalesced_and_stale_requests_are_bounded() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        server.state.session = 91;
++        let mut client = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        // Unknown extension is safely ignored without losing framing of next record.
++        let packet = record(0x801f, 0, 91, 0, 7, 0, &[b'x'; 80], [0; 4]);
++        client.write_all(&packet[..17]).unwrap();
++        server.read_request();
++        assert_eq!(server.state.control_sequence, 0);
++        client.write_all(&[packet[17..].to_vec(), request(91, 17)].concat()).unwrap();
++        for _ in 0..8 { server.read_request(); }
++        assert!(server.client.is_some());
++        assert_eq!(server.state.control_sequence, 7);
++        assert_eq!(server.last_request, Some((91, 17)));
++        client.write_all(&record(0x8010, 0, 90, 0, 9, 0, b"next", [4, 0, 0, 0])).unwrap();
++        for _ in 0..3 { server.read_request(); }
++        assert_eq!(server.state.control_sequence, 7);
++        client.write_all(&record(0x8010, 0, 91, 0, 6, 0, b"next", [4, 0, 0, 0])).unwrap();
++        for _ in 0..3 { server.read_request(); }
++        assert_eq!(server.state.control_sequence, 7);
++    }
++    #[test]
+     fn real_client_reverse_keyframe_request_parses_exact_session_and_stream() {
+         let dir = TempSocketDir::new();
+         let mut server = test_server(&dir);
+@@ -1330,6 +1409,8 @@
+             ],
+             audio: vec![(4, m), (5, m)],
+             audio_gain: (250, 100_000, 3),
++            extensions: Vec::new(),
++            control_sequence: 0,
+         };
+         for _ in 0..2 {
+             let mut client = UnixStream::connect(dir.socket()).unwrap();
+@@ -1387,6 +1468,8 @@
+             video: vec![(3, VideoRole::Main, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)],
+             audio: vec![(4, m)],
+             audio_gain: (0, 1_000_000, 1),
++            extensions: Vec::new(),
++            control_sequence: 0,
+         };
+         let mut kinds = Vec::new();
+         for sequence in 1..=8 {
+--- a/c2a/catplay_c2a/src/preview_rx.rs
++++ b/c2a/catplay_c2a/src/preview_rx.rs
+@@ -169,6 +169,9 @@
+ 
+ #[async_trait]
+ impl AirPlayReceiverSink for PreviewRxSession {
++    async fn open_iap2(&mut self) -> Option<catplay_iap2_client::CsmSessionBox> {
++        Some(Box::new(crate::input_iap2::InputIap2::new(self.media.clone(), self.session_epoch?)))
++    }
+     fn init(&mut self, session: AirPlayReceiverHandleRef) -> RtspResult<()> {
+         self.handle = Some(session.clone());
+         self.session_epoch = Some(self.media.begin_session(session));
+@@ -215,7 +218,13 @@
+         let touch = touch_hid_device(config.main.width, config.main.height);
+         self.media.set_touch_device(touch.clone());
+         info.hid_devices.clear();
++        info.hid_devices.push(crate::control_ext::multi_device(&touch));
+         info.hid_devices.push(touch);
++        for kind in 0..4 { if let Some(device) = crate::control_ext::device(kind) { info.hid_devices.push(device); } }
++        if let Some(epoch) = self.session_epoch {
++            self.media.extension(epoch, 0x48, [2, 1, 1, 0], Vec::new());
++            self.media.extension(epoch, 0x3a, [0, 0, (config.main.width << 16) | config.main.height, 0], Vec::new());
++        }
+     }
+ 
+     async fn on_record(&mut self) -> RtspResult<()> {
+--- /dev/null
++++ b/c2a/catplay_c2a/src/control_ext.rs
+@@ -0,0 +1,190 @@
++//! CPMF controls to actual receiver commands/HID reports. IPC numbers are local;
++//! HID layouts follow catplay_hid and LIVI stack/hid.ts. Unknown operations are
++//! rejected, never acknowledged as executed. No external device side effects here.
++use catplay_carplay::{carplay_rx::AirPlayReceiverHandleRef, msg::{Command, CommandRequestSiri, CommandSetNightMode, CommandSetLimitedUI, HidDevice, SiriAction}};
++use catplay_hid::{KnobReport, MediaButtonsReport, TelephonyButtonsReport, ProximityReport};
++use std::time::Instant;
++
++pub const CONTACTS: usize = 2;
++pub const MAX_PAYLOAD: usize = 192;
++const MAIN: &str = "5E2D6D6C-8E32-4E2A-9A74-000000001080";
++
++pub fn device(kind: u8) -> Option<HidDevice> {
++    let (name, descriptor) = match kind {
++        0 => ("Media", MediaButtonsReport::descriptor().to_vec()),
++        1 => ("Telephone", TelephonyButtonsReport::descriptor().to_vec()),
++        2 => ("Knob", KnobReport::descriptor().to_vec()),
++        3 => ("Proximity", ProximityReport::descriptor().to_vec()),
++        _ => return None,
++    };
++    Some(HidDevice { display_uuid: MAIN.into(), hid_country_code: 0,
++        hid_descriptor: descriptor.into(), hid_product_id: 2 + kind as u16,
++        hid_vendor_id: 2, name: format!("Zero2W {name}"),
++        uuid: format!("5E2D6D6C-8E32-4E2A-9A74-00000000109{kind}") })
++}
++
++pub fn multi_device(single: &HidDevice) -> HidDevice {
++    let mut multi = single.clone();
++    let single_bytes = single.hid_descriptor.as_ref();
++    let mut descriptor = single_bytes[..6].to_vec();
++    for _ in 0..CONTACTS {
++        descriptor.extend_from_slice(&[0x05, 0x0d]);
++        descriptor.extend_from_slice(&single_bytes[6..single_bytes.len() - 1]);
++    }
++    descriptor.push(0xc0);
++    multi.hid_descriptor = descriptor.into();
++    multi.uuid = "5E2D6D6C-8E32-4E2A-9A74-000000001083".into();
++    multi.name = "Zero2W Multitouch".into();
++    multi
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum Action {
++    Hid { kind: u8, bytes: Vec<u8>, release: bool },
++    Siri(u32),
++    Touch(Vec<u8>),
++    Night(bool),
++    LimitedUi(bool),
++}
++
++fn knob_key(code: u32) -> Option<Vec<u8>> {
++    if !(1..=9).contains(&code) { return None; }
++    Some(KnobReport::new(code == 1, code == 2, code == 3,
++        if code == 4 { -1 } else if code == 5 { 1 } else { 0 },
++        if code == 6 { -1 } else if code == 7 { 1 } else { 0 },
++        if code == 8 { -1 } else if code == 9 { 1 } else { 0 }).to_bytes().to_vec())
++}
++
++fn text(payload: &[u8]) -> Option<&str> {
++    let payload = payload.strip_suffix(&[0]).unwrap_or(payload);
++    if payload.contains(&0) { return None; }
++    std::str::from_utf8(payload).ok()
++}
++
++/// Return a fully validated bounded batch before sending anything to the phone.
++pub fn actions(kind: u16, p: [u32; 4], payload: &[u8], width: u32, height: u32) -> Option<Vec<Action>> {
++    if payload.len() > MAX_PAYLOAD { return None; }
++    let mut out = Vec::new();
++    match kind {
++        0x8010 if p[1] <= 1 && p[2..] == [0, 0] => {
++            let category = p[0] >> 16;
++            let code = p[0] & 0xffff;
++            text(payload)?;
++            if (category == 0 && code <= 6) || (category == 1 && code <= 17) {
++                out.push(Action::Hid { kind: category as u8, bytes: vec![if p[1] == 1 { 0 } else { code as u8 }], release: p[1] == 0 });
++            } else if category == 2 {
++                let mut bytes = knob_key(code)?;
++                if p[1] == 1 { bytes.fill(0); }
++                out.push(Action::Hid { kind: 2, bytes, release: p[1] == 0 });
++            } else { return None; }
++        }
++        0x8011 if (1..=CONTACTS as u32).contains(&p[0]) && p[1..] == [0, 0, 0] && payload.len() == p[0] as usize * 8 => {
++            let mut report = vec![0; CONTACTS * 6];
++            let mut seen = [false; CONTACTS];
++            for i in 0..CONTACTS { report[i * 6] = i as u8; }
++            for point in payload.chunks_exact(8) {
++                let x = u16::from_be_bytes([point[0], point[1]]);
++                let y = u16::from_be_bytes([point[2], point[3]]);
++                let id = point[4] as usize;
++                if id >= CONTACTS || seen[id] || point[5] > 2 || point[6..] != [0, 0] || x as u32 >= width || y as u32 >= height { return None; }
++                seen[id] = true;
++                let off = id * 6;
++                report[off + 1] = u8::from(point[5] != 0);
++                report[off + 2..off + 4].copy_from_slice(&x.to_le_bytes());
++                report[off + 4..off + 6].copy_from_slice(&y.to_le_bytes());
++            }
++            out.push(Action::Touch(report));
++        }
++        0x8012 if p[0] <= 4 && p[2..] == [0, 0] && payload.is_empty() => {
++            let n = (p[1] as i32).checked_abs()?;
++            if n > 127 { return None; }
++            let (x, y) = match p[0] { 0 => (-n as i8, 0), 1 => (n as i8, 0), 2 => (0, -n as i8), 3 => (0, n as i8), _ => (0, 0) };
++            out.push(Action::Hid { kind: 2, bytes: KnobReport::new(p[0] == 4, false, false, x, y, 0).to_bytes().to_vec(), release: true });
++        }
++        0x8013 if p == [0; 4] => {
++            let name = text(payload)?;
++            let code = match name { "select" | "select_down" | "select_up" => 1,
++                "home" => 2, "back" => 3, "left" => 4, "right" => 5,
++                "up" => 6, "down" => 7, "wheel_left" => 8, "wheel_right" => 9,
++                _ => return None };
++            let mut bytes = knob_key(code)?;
++            if name == "select_up" { bytes.fill(0); }
++            out.push(Action::Hid { kind: 2, bytes, release: name != "select_down" && name != "select_up" });
++        }
++        0x8014 if p[0] <= 1 && p[1..] == [0, 0, 0] && payload.is_empty() => {
++            out.push(Action::Hid { kind: 3, bytes: vec![p[0] as u8], release: false });
++        }
++        0x8015 if p[0] <= 2 && p[1..] == [0, 0, 0] && payload.is_empty() => { out.push(Action::Siri(p[0])); }
++        0x8016 if p[1..] == [0, 0, 0] => {
++            let digits = text(payload)?;
++            let mut keys = Vec::new();
++            match p[0] {
++                0 if digits.is_empty() => keys.push(1),
++                1 if digits.is_empty() => keys.push(3),
++                4 if digits.is_empty() => keys.push(4),
++                2 | 3 if !digits.is_empty() && digits.len() <= 15 => {
++                    for c in digits.bytes() { keys.push(match c { b'0'..=b'9' => c - b'0' + 5, b'*' => 15, b'#' => 16, _ => return None }); }
++                    if p[0] == 2 { keys.push(1); }
++                }
++                _ => return None,
++            }
++            for key in keys { out.push(Action::Hid { kind: 1, bytes: vec![key], release: true }); }
++        }
++        0x8017 if p[0] <= 1 && p[1..] == [0, 0, 0] => {
++            out.push(match text(payload)? {
++                "night_mode" => Action::Night(p[0] != 0),
++                "limited_ui" => Action::LimitedUi(p[0] != 0),
++                _ => return None,
++            });
++        }
++        _ => return None,
++    }
++    Some(out)
++}
++
++pub fn dispatch(handle: &AirPlayReceiverHandleRef, touch: Option<&HidDevice>, actions: Vec<Action>) {
++    for action in actions {
++        match action {
++            Action::Hid { kind, bytes, release } => if let Some(device) = device(kind) {
++                handle.send_hid_report(Instant::now(), &device, &bytes);
++                if release { handle.send_hid_report(Instant::now(), &device, &vec![0; bytes.len()]); }
++            },
++            Action::Touch(bytes) => if let Some(device) = touch { handle.send_hid_report(Instant::now(), &multi_device(device), &bytes); },
++            Action::Night(night_mode) => handle.send_command_and_forget(Command::SetNightMode(CommandSetNightMode { night_mode })),
++            Action::LimitedUi(limited_ui) => handle.send_command_and_forget(Command::SetLimitedUI(CommandSetLimitedUI { limited_ui })),
++            Action::Siri(value) => {
++                let siri_action = match value { 1 => SiriAction::ButtonUp, 2 => SiriAction::Prewarm, _ => SiriAction::ButtonDown };
++                handle.send_command_and_forget(Command::RequestSiri(CommandRequestSiri { siri_action }));
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn actual_hid_categories_and_release() {
++        assert_eq!(actions(0x8010, [4, 0, 0, 0], b"next", 1920, 1080).unwrap(), vec![Action::Hid { kind: 0, bytes: vec![4], release: true }]);
++        assert!(actions(0x8010, [0x30001, 0, 0, 0], b"x", 1, 1).is_none());
++        assert_eq!(actions(0x8010, [0x20002, 0, 0, 0], b"home", 1, 1).unwrap(), vec![Action::Hid { kind: 2, bytes: vec![2, 0, 0, 0], release: true }]);
++        assert_eq!(actions(0x8013, [0; 4], b"back", 1, 1).unwrap(), vec![Action::Hid { kind: 2, bytes: vec![4, 0, 0, 0], release: true }]);
++        assert_eq!(actions(0x8013, [0; 4], b"select_up", 1, 1).unwrap(), vec![Action::Hid { kind: 2, bytes: vec![0; 4], release: false }]);
++        assert!(actions(0x8013, [0; 4], b"unmapped", 1, 1).is_none());
++        assert_eq!(actions(0x8017, [1, 0, 0, 0], b"night_mode", 1, 1).unwrap(), vec![Action::Night(true)]);
++        assert!(actions(0x8017, [1, 0, 0, 0], b"window", 1, 1).is_none());
++        assert_eq!(actions(0x8012, [0, 3, 0, 0], &[], 1, 1).unwrap(), vec![Action::Hid { kind: 2, bytes: vec![0, 253, 0, 0], release: true }]);
++        assert!(actions(0x8012, [0, i32::MIN as u32, 0, 0], &[], 1, 1).is_none());
++        assert_eq!(actions(0x8016, [3, 0, 0, 0], b"12*#", 1, 1).unwrap().len(), 4);
++        assert!(actions(0x8016, [3, 0, 0, 0], b"12z", 1, 1).is_none());
++        assert_eq!(actions(0x8015, [1, 0, 0, 0], &[], 1, 1).unwrap(), vec![Action::Siri(1)]);
++        assert!(actions(0x8018, [0; 4], &[], 1, 1).is_none());
++    }
++    #[test]
++    fn multitouch_slots_are_stable_and_bounded() {
++        let p = [0, 3, 0, 4, 1, 1, 0, 0];
++        assert_eq!(actions(0x8011, [1, 0, 0, 0], &p, 100, 100).unwrap(), vec![Action::Touch(vec![0,0,0,0,0,0,1,1,3,0,4,0])]);
++        assert!(actions(0x8011, [1, 0, 0, 0], &p, 3, 100).is_none());
++        assert!(actions(0x8011, [2, 0, 0, 0], &[p, p].concat(), 100, 100).is_none());
++    }
++}
+--- /dev/null
++++ b/c2a/catplay_c2a/src/input_iap2.rs
+@@ -0,0 +1,116 @@
++//! Real wireless iAP2 subscription -> bounded CPMF metadata/telephony/artwork.
++//! No file/OTA/activation success is synthesized by this adapter.
++use async_trait::async_trait;
++use catplay_csm::{decoder::{CsmFlag, CsmPacketBox}, msg::*};
++use catplay_iap2_client::{CsmSession, CsmSessionResult, CsmClientHandleRef, CsmFileTransferEvent};
++use crate::MediaTap;
++
++pub struct InputIap2 {
++    media: MediaTap,
++    epoch: u64,
++    fields: [String; 6],
++    duration: u32,
++    position: u32,
++    track: u32,
++    playing: bool,
++    art_id: Option<u8>,
++    art_revision: u32,
++}
++
++fn bounded(value: &str, limit: usize) -> String {
++    let mut n = value.len().min(limit);
++    while !value.is_char_boundary(n) { n -= 1; }
++    value[..n].replace('\0', "")
++}
++
++impl InputIap2 {
++    pub fn new(media: MediaTap, epoch: u64) -> Self {
++        Self { media, epoch, fields: Default::default(), duration: 0, position: 0, track: 0,
++            playing: false, art_id: None, art_revision: 0 }
++    }
++    fn update_metadata(&mut self, update: &NowPlayingUpdate) {
++        if let Some(item) = update.media_item.as_ref() {
++            let texts = [(0, &item.title), (1, &item.artist), (2, &item.album_title), (3, &item.album_artist), (5, &item.genre)];
++            for (index, value) in texts { if let Some(value) = value { self.fields[index] = bounded(value, 127); } }
++            if let Some(value) = item.playback_duration_in_ms { self.duration = value; }
++            if let Some(value) = item.album_track_number { self.track = (self.track & 0xffff) | (value as u32) << 16; }
++            if let Some(value) = item.album_track_count { self.track = (self.track & 0xffff0000) | value as u32; }
++            if let Some(value) = item.artwork_file_transfer_id { self.art_id = Some(value); }
++        }
++        if let Some(playback) = update.playback_attributes.as_ref() {
++            if let Some(value) = playback.playback_elapsed_time_ms { self.position = value; }
++            if let Some(value) = playback.playback_app_name.as_ref() { self.fields[4] = bounded(value, 127); }
++            if let Some(value) = playback.playback_status.as_ref() { self.playing = matches!(value, PlaybackStatus::Playing); }
++        }
++        let mut bytes = Vec::with_capacity(768);
++        for field in &self.fields { bytes.extend_from_slice(field.as_bytes()); bytes.push(0); }
++        self.media.extension(self.epoch, 0x30, [1 | (u32::from(self.playing) << 1), self.duration, self.position, self.track], bytes);
++    }
++}
++
++#[async_trait]
++impl CsmSession for InputIap2 {
++    async fn start(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<()> {
++        handle.send(&StartNowPlayingUpdates::all())?;
++        handle.send(&StartCallStateUpdates { remote_id: CsmFlag::Yes, display_name: CsmFlag::Yes,
++            status: CsmFlag::Yes, direction: CsmFlag::Yes, call_uuid: CsmFlag::Yes, ..Default::default() })?;
++        Ok(())
++    }
++    async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
++        if let Some(update) = packet.cast::<NowPlayingUpdate>() { self.update_metadata(update); }
++        if let Some(call) = packet.cast::<CallStateUpdate>() {
++            let status = match call.status { CallStateUpdateStatus::Disconnected | CallStateUpdateStatus::Disconnecting => 0,
++                CallStateUpdateStatus::Ringing => 1, CallStateUpdateStatus::Sending | CallStateUpdateStatus::Connecting => 2,
++                CallStateUpdateStatus::Active => 3, CallStateUpdateStatus::Held => 4 };
++            let mut bytes = bounded(call.display_name.as_deref().unwrap_or(""), 127).into_bytes();
++            bytes.push(0);
++            bytes.extend_from_slice(bounded(call.remote_id.as_deref().unwrap_or(""), 95).as_bytes());
++            bytes.push(0);
++            self.media.extension(self.epoch, 0x36, [status, 0, 0, 2], bytes);
++        }
++        Ok(())
++    }
++    async fn on_file_event(&mut self, id: u8, event: CsmFileTransferEvent, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
++        if self.art_id != Some(id) { return Ok(()); }
++        match event {
++            CsmFileTransferEvent::Completed { data, size, .. } if size == data.len() as u64 && size > 0 && size <= 128 * 1024 => {
++                self.art_revision = self.art_revision.wrapping_add(1).max(1);
++                self.media.extension(self.epoch, 0x31, [0, 1, size as u32, self.art_revision], data);
++                self.art_id = None;
++            }
++            CsmFileTransferEvent::Cancelled => self.art_id = None,
++            _ => {}
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn text_is_bounded_without_splitting_or_injecting_fields() {
++        assert_eq!(bounded("abc你好", 5), "abc");
++        assert_eq!(bounded("a\0b", 99), "ab");
++        assert_eq!(bounded("", 0), "");
++    }
++    #[test]
++    fn real_subscription_update_produces_bounded_incremental_cpmf_metadata() {
++        let media = MediaTap::test_tap();
++        let epoch = media.test_begin_session();
++        let mut input = InputIap2::new(media.clone(), epoch);
++        input.update_metadata(&NowPlayingUpdate {
++            media_item: Some(MediaItem { title: Some("测试标题".into()), artist: Some("artist".into()), playback_duration_in_ms: Some(42), ..Default::default() }),
++            playback_attributes: Some(PlaybackAttributes { playback_status: Some(PlaybackStatus::Playing), playback_elapsed_time_ms: Some(12), ..Default::default() }),
++        });
++        let (kind, p, bytes) = media.test_pop_extension().unwrap();
++        assert_eq!(kind, 0x30); assert_eq!(p, [3, 42, 12, 0]);
++        assert!(bytes.starts_with("测试标题\0artist\0".as_bytes()));
++        input.update_metadata(&NowPlayingUpdate { media_item: None, playback_attributes: Some(PlaybackAttributes { playback_elapsed_time_ms: Some(20), ..Default::default() }) });
++        let (_, p, next) = media.test_pop_extension().unwrap();
++        assert_eq!(p[2], 20); assert_eq!(next, bytes);
++        media.end_session_for_epoch(epoch, 0);
++        input.update_metadata(&NowPlayingUpdate::default());
++        assert!(media.test_pop_extension().is_none());
++    }
++}

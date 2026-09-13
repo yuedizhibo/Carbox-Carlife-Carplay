@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zero2w 车载互联管理后台</title>
+<style>{{STYLE}}</style>
+</head>
+<body>
+<header class="bar">
+  <h1>zero2w 车载互联</h1>
+  <div class="bar-item">
+    <span class="label">活跃输入</span>
+    <strong id="activeName">—</strong>
+    <span id="activeKind" class="tag">—</span>
+  </div>
+  <div class="bar-item">
+    <span class="label">模式</span>
+    <span id="modeName" class="tag">—</span>
+    <button id="btnAuto" class="btn sm">自动</button>
+    <button id="btnManual" class="btn sm">手动</button>
+  </div>
+  <div class="bar-item grow">
+    <input id="token" type="password" placeholder="访问令牌（如服务端设置了 --token）" autocomplete="off">
+    <button id="btnToken" class="btn sm">应用令牌</button>
+  </div>
+</header>
+
+<main class="grid">
+  <section class="col inputs">
+    <h2>输入 <span id="inputCount" class="muted">0</span></h2>
+    <div id="inputList" class="cards">正在加载…</div>
+    <p class="hint">没有输入连接时，桌面输入会兜底；多个输入同时在线时按手动选择。</p>
+  </section>
+
+  <section class="col viewer">
+    <div class="viewer-head">
+      <h2>画面 <span id="viewerSource" class="muted">—</span></h2>
+      <label class="chk"><input id="audioOn" type="checkbox"> 启用音频</label>
+      <span id="mediaStatus" class="muted">等待连接</span>
+    </div>
+    <div class="canvases">
+      <figure>
+        <figcaption>主屏 <span id="mainStats" class="muted">0 fps</span></figcaption>
+        <canvas id="mainCanvas" width="1280" height="720" class="screen"></canvas>
+        <div class="hint">在此按住拖动即可回传触控（down / move / up）</div>
+      </figure>
+      <figure>
+        <figcaption>副屏 <span id="altStats" class="muted">0 fps</span></figcaption>
+        <canvas id="altCanvas" width="1280" height="720" class="screen"></canvas>
+        <div class="hint">只有协商出副屏会话时才有内容</div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="col side">
+    <h2>硬键</h2>
+    <div class="keys">
+      <button class="btn key" data-key="up">↑</button>
+      <button class="btn key" data-key="down">↓</button>
+      <button class="btn key" data-key="left">←</button>
+      <button class="btn key" data-key="right">→</button>
+      <button class="btn key" data-key="enter">确认</button>
+      <button class="btn key" data-key="back">返回</button>
+      <button class="btn key" data-key="home">主页</button>
+      <button class="btn key" data-key="menu">菜单</button>
+      <button class="btn key" data-key="volume_up">音量+</button>
+      <button class="btn key" data-key="volume_down">音量−</button>
+    </div>
+
+    <h2>显示配置（下一次 CarPlay 会话）</h2>
+    <form id="displayForm" class="form">
+      <fieldset><legend>主屏</legend>
+        <label>宽 <input id="mw" type="number" min="320" max="2560" step="2"></label>
+        <label>高 <input id="mh" type="number" min="240" max="1440" step="2"></label>
+        <label>帧率 <input id="mf" type="number" min="1" max="60"></label>
+      </fieldset>
+      <fieldset><legend>副屏</legend>
+        <label><input id="ae" type="checkbox"> 启用</label>
+        <label>宽 <input id="aw" type="number" min="320" max="2560" step="2"></label>
+        <label>高 <input id="ah" type="number" min="240" max="1440" step="2"></label>
+        <label>帧率 <input id="af" type="number" min="1" max="60"></label>
+      </fieldset>
+      <button class="btn" type="submit">保存</button>
+      <span id="displayStatus" class="muted"></span>
+    </form>
+
+    <h2>诊断</h2>
+    <pre id="rawState" class="pre">—</pre>
+  </section>
+  <section class="col nowplaying">
+    <h2>正在播放 <span id="npState" class="muted">—</span></h2>
+    <div class="np-head">
+      <div class="np-art"><img id="npArt" alt="专辑封面" hidden><div id="npArtNone" class="np-art-none">无封面</div></div>
+      <dl class="kv">
+        <dt>标题</dt><dd id="npTitle">—</dd>
+        <dt>歌手</dt><dd id="npArtist">—</dd>
+        <dt>专辑</dt><dd id="npAlbum">—</dd>
+        <dt>来源 App</dt><dd id="npApp">—</dd>
+        <dt>曲目</dt><dd id="npTrack">—</dd>
+      </dl>
+    </div>
+    <div class="np-progress">
+      <span id="npPos" class="muted">0:00</span>
+      <input id="npSeek" type="range" min="0" max="1000" value="0" step="1">
+      <span id="npDur" class="muted">0:00</span>
+    </div>
+    <div class="np-buttons">
+      <button class="btn sm" id="npPrev">上一首</button>
+      <button class="btn sm" id="npRew">快退</button>
+      <button class="btn sm" id="npPlay">播放/暂停</button>
+      <button class="btn sm" id="npFf">快进</button>
+      <button class="btn sm" id="npNext">下一首</button>
+      <span id="npSeekStatus" class="muted"></span>
+    </div>
+    <h2 style="margin-top:.9rem">歌词</h2>
+    <div id="npLyrics" class="lyrics">无歌词</div>
+  </section>
+
+  <section class="col interact">
+    <h2>交互注入</h2>
+    <fieldset class="form"><legend>多点触控（主屏坐标）</legend>
+      <div class="row">
+        <button class="btn sm" data-mt="2">2 点</button>
+        <button class="btn sm" data-mt="3">3 点</button>
+        <button class="btn sm" data-mt="4">4 点</button>
+        <button class="btn sm" data-mt="5">5 点</button>
+        <button class="btn sm" data-mt="0" id="mtUp">全部抬起</button>
+      </div>
+      <label style="display:block;margin-top:.4rem">自定义触点 <input id="mtCustom" type="text" placeholder="x,y;x,y;..." style="width:14rem"></label>
+      <div class="row"><button class="btn sm" id="mtSend">发送自定义多点</button></div>
+      <div id="mtStatus" class="muted"></div>
+    </fieldset>
+    <fieldset class="form"><legend>旋钮 / 触摸板 / 接近</legend>
+      <div class="row">
+        <button class="btn sm" data-knob="left">◀ 旋钮左</button>
+        <button class="btn sm" data-knob="right">旋钮右 ▶</button>
+        <button class="btn sm" data-knob="up">▲ 旋钮上</button>
+        <button class="btn sm" data-knob="down">▼ 旋钮下</button>
+        <button class="btn sm" data-knob="press">按下</button>
+      </div>
+      <label>步长 <input id="knobSteps" type="number" value="1" min="-32768" max="32767"></label>
+      <div class="row" style="margin-top:.4rem">
+        <button class="btn sm" data-gesture="swipe_left">左滑</button>
+        <button class="btn sm" data-gesture="swipe_right">右滑</button>
+        <button class="btn sm" data-gesture="swipe_up">上滑</button>
+        <button class="btn sm" data-gesture="swipe_down">下滑</button>
+        <button class="btn sm" data-gesture="pinch_in">捏合</button>
+        <button class="btn sm" data-gesture="pinch_out">张开</button>
+      </div>
+      <div class="row" style="margin-top:.4rem">
+        <button class="btn sm" data-proximity="1">接近（遮住）</button>
+        <button class="btn sm" data-proximity="0">远离</button>
+        <button class="btn sm" id="btnVoice">语音键（Siri/助手）</button>
+      </div>
+      <div id="actStatus" class="muted"></div>
+    </fieldset>
+    <fieldset class="form"><legend>媒体键</legend>
+      <div class="row">
+        <button class="btn sm" data-media="play">播放</button>
+        <button class="btn sm" data-media="pause">暂停</button>
+        <button class="btn sm" data-media="next">下一首</button>
+        <button class="btn sm" data-media="prev">上一首</button>
+        <button class="btn sm" data-media="ff">快进</button>
+        <button class="btn sm" data-media="rew">快退</button>
+      </div>
+    </fieldset>
+    <fieldset class="form"><legend>车控（原样转发给手机）</legend>
+      <div class="row">
+        <button class="btn sm" data-vehctrl="ac_temp_up">空调升温</button>
+        <button class="btn sm" data-vehctrl="ac_temp_down">空调降温</button>
+        <button class="btn sm" data-vehctrl="ac_fan_up">风力+</button>
+        <button class="btn sm" data-vehctrl="window_open">开车窗</button>
+        <button class="btn sm" data-vehctrl="window_close">关车窗</button>
+      </div>
+    </fieldset>
+  </section>
+
+  <section class="col telemetry">
+    <h2>车况 <span id="vehValid" class="tag">—</span></h2>
+    <dl class="kv grid2">
+      <dt>速度</dt><dd id="vehSpeed">—</dd>
+      <dt>挡位</dt><dd id="vehGear">—</dd>
+      <dt>转速</dt><dd id="vehRpm">—</dd>
+      <dt>油量</dt><dd id="vehFuel">—</dd>
+      <dt>续航</dt><dd id="vehRange">—</dd>
+      <dt>车外温度</dt><dd id="vehTemp">—</dd>
+      <dt>GPS</dt><dd id="vehGps">—</dd>
+      <dt>航向</dt><dd id="vehHeading">—</dd>
+      <dt>灯光</dt><dd id="vehLights">—</dd>
+      <dt>手刹</dt><dd id="vehBrake">—</dd>
+      <dt>VIN</dt><dd id="vehVin">—</dd>
+    </dl>
+
+    <h2 style="margin-top:.9rem">导航 <span id="navState" class="tag">—</span></h2>
+    <dl class="kv grid2">
+      <dt>转向</dt><dd id="navManeuver">—</dd>
+      <dt>原始码</dt><dd id="navCode">—</dd>
+      <dt>当前道路</dt><dd id="navRoad">—</dd>
+      <dt>下一段</dt><dd id="navNextRoad">—</dd>
+      <dt>到动作</dt><dd id="navDistManeuver">—</dd>
+      <dt>剩余里程</dt><dd id="navRemain">—</dd>
+      <dt>剩余时间</dt><dd id="navTime">—</dd>
+      <dt>预计到达</dt><dd id="navEta">—</dd>
+      <dt>目的地</dt><dd id="navDest">—</dd>
+    </dl>
+
+    <h2 style="margin-top:.9rem">电话 <span id="telState" class="tag">—</span></h2>
+    <dl class="kv">
+      <dt>来电</dt><dd id="telCaller">—</dd>
+      <dt>号码</dt><dd id="telNumber">—</dd>
+      <dt>时长</dt><dd id="telDuration">—</dd>
+      <dt>信号/电量</dt><dd id="telRssi">—</dd>
+    </dl>
+    <div class="row" style="margin-top:.4rem">
+      <button class="btn sm" data-tel="answer">接听</button>
+      <button class="btn sm" data-tel="hangup">挂断</button>
+      <button class="btn sm" data-tel="dial">重拨</button>
+    </div>
+    <div class="dtmf" id="dtmfPad">
+      <button class="btn sm" data-dtmf="1">1</button><button class="btn sm" data-dtmf="2">2</button><button class="btn sm" data-dtmf="3">3</button>
+      <button class="btn sm" data-dtmf="4">4</button><button class="btn sm" data-dtmf="5">5</button><button class="btn sm" data-dtmf="6">6</button>
+      <button class="btn sm" data-dtmf="7">7</button><button class="btn sm" data-dtmf="8">8</button><button class="btn sm" data-dtmf="9">9</button>
+      <button class="btn sm" data-dtmf="*">*</button><button class="btn sm" data-dtmf="0">0</button><button class="btn sm" data-dtmf="#">#</button>
+    </div>
+
+    <h2 style="margin-top:.9rem">通讯录 <span id="contactState" class="muted">—</span></h2>
+    <ul id="contactList" class="list"><li class="muted">—</li></ul>
+    <h2 style="margin-top:.9rem">通话记录 <span id="calllogState" class="muted">—</span></h2>
+    <ul id="calllogList" class="list"><li class="muted">—</li></ul>
+  </section>
+
+  <section class="col syspanel">
+    <h2>显示设置</h2>
+    <form id="cfgForm" class="form">
+      <fieldset><legend>画面校准</legend>
+        <label>gamma <input id="cfgGamma" type="number" min="10" max="200" step="1" value="100"></label>
+        <label>对比度 <input id="cfgContrast" type="number" min="10" max="200" step="1" value="100"></label>
+        <label>饱和度 <input id="cfgSaturation" type="number" min="10" max="200" step="1" value="100"></label>
+      </fieldset>
+      <fieldset><legend>主题 / safe area</legend>
+        <label><input id="cfgDayNight" type="checkbox"> 夜间模式</label>
+        <label>上 <input id="cfgSafeTop" type="number" min="0" max="4096" value="0"></label>
+        <label>下 <input id="cfgSafeBottom" type="number" min="0" max="4096" value="0"></label>
+        <label>左 <input id="cfgSafeLeft" type="number" min="0" max="4096" value="0"></label>
+        <label>右 <input id="cfgSafeRight" type="number" min="0" max="4096" value="0"></label>
+      </fieldset>
+      <fieldset><legend>副屏平面</legend>
+        <label><input id="cfgAuxEnabled" type="checkbox"> 启用</label>
+        <label>x <input id="cfgAuxX" type="number" min="0" max="8192" value="0"></label>
+        <label>y <input id="cfgAuxY" type="number" min="0" max="8192" value="0"></label>
+        <label>宽 <input id="cfgAuxW" type="number" min="0" max="8192" value="0"></label>
+        <label>高 <input id="cfgAuxH" type="number" min="0" max="8192" value="0"></label>
+      </fieldset>
+      <fieldset><legend>帧率请求</legend>
+        <label>目标 <input id="cfgTargetFps" type="number" min="1" max="120" value="60"></label>
+        <span class="muted">实际 <strong id="cfgActualFps">—</strong></span>
+      </fieldset>
+      <button class="btn" type="submit">应用显示设置</button>
+      <span id="cfgStatus" class="muted"></span>
+    </form>
+
+    <h2 style="margin-top:.9rem">音频 / 链路</h2>
+    <dl class="kv">
+      <dt>导航压低</dt><dd id="audDuck">—</dd>
+      <dt>媒体/导航音量</dt><dd id="audVolume">—</dd>
+      <dt>流</dt><dd id="audStream">—</dd>
+      <dt>交互能力</dt><dd id="intCaps">—</dd>
+      <dt>激活/加密</dt><dd id="lnkActivation">—</dd>
+      <dt>文件传输</dt><dd id="lnkFile">—</dd>
+      <dt>OTA</dt><dd id="lnkOta">—</dd>
+    </dl>
+
+    <h2 style="margin-top:.9rem">多设备会话 <span id="sessCount" class="muted">0</span></h2>
+    <ul id="sessList" class="list"><li class="muted">—</li></ul>
+    <div class="row">
+      <input id="sessId" type="text" placeholder="会话 id" style="width:9rem">
+      <button class="btn sm" id="sessAdd">登记</button>
+      <button class="btn sm" id="sessSwitch">切为活跃</button>
+    </div>
+    <div id="sessStatus" class="muted"></div>
+  </section>
+</main>
+
+<script>{{SCRIPT}}</script>
+</body>
+</html>

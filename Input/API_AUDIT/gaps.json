@@ -1,0 +1,176 @@
+{
+  "meta": {
+    "service_types_kt": {
+      "const_val_lines_total": 309,
+      "const_val_rows_extracted": 309,
+      "const_val_complete": true
+    },
+    "service_types_h": {
+      "constexpr_lines_total": 310,
+      "constexpr_rows_extracted": 310,
+      "constexpr_complete": true
+    },
+    "session_cpp": {
+      "msg_cases": 60,
+      "channel_cases": 24,
+      "switch_statements": 5
+    },
+    "vehicle_lib": {
+      "files": [
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CCarLifeLib.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CCarLifeLibWrapper.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CCarLifeLog.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CCmdChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CConnectionSetupModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CConnectManager.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CCtrlChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CMediaChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CommonUtil.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CSocketConnector.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CTranRecvPackageProcess.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CTTSChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CVideoChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CVirtualShell.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/CVRChannelModule.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/ISocket.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/socket.h",
+        "Reference/carlife-vehicle-lib/CarLife-Vehicle-Lib/LibSource/include/socketv6.h"
+      ],
+      "declarations_extracted": 492,
+      "structs_extracted": 57,
+      "unhandled_declaration_like": 0
+    },
+    "feature_config_java": {
+      "static_final_string_total": 76,
+      "extracted": 73
+    },
+    "apollo_sdk": {
+      "files_scanned": 74,
+      "extracted": 795,
+      "excluded_path_segment": "/internal/",
+      "non_public_members": 72,
+      "visibility_note": "visibility is derived from the declaration line; non-public members are kept visible"
+    },
+    "livi_input_command": {
+      "entries": 15
+    },
+    "livi_channel_registrations": 58
+  },
+  "gaps": [
+    {
+      "source": "Reference/LIVI/native/livi-helperd/crates/iap2-mfi/src/lib.rs",
+      "line": 25,
+      "name": "MfiError",
+      "reason": "pub enum outside framing/control crates (not enumerated)",
+      "variants": [
+        "Timeout",
+        "ChallengeSize",
+        "AuthFailed",
+        "NoChip",
+        "Io"
+      ]
+    },
+    {
+      "source": "Reference/LIVI/native/livi-helperd/crates/livi-aa/src/link.rs",
+      "line": 11,
+      "name": "Item",
+      "reason": "pub enum outside framing/control crates (not enumerated)",
+      "variants": [
+        "Message",
+        "Control"
+      ]
+    },
+    {
+      "source": "Reference/LIVI/native/livi-helperd/crates/livi-aa/src/tls.rs",
+      "line": 32,
+      "name": "Error",
+      "reason": "pub enum outside framing/control crates (not enumerated)",
+      "variants": [
+        "Tls",
+        "Io",
+        "Cert"
+      ]
+    },
+    {
+      "source": "Reference/LIVI/src/preload/index.ts",
+      "line": 13,
+      "name": "usb-event",
+      "reason": "ipcRenderer channel used outside a captured api property (module-scope listener)"
+    },
+    {
+      "source": "Reference/LIVI/src/preload/index.ts",
+      "line": 34,
+      "name": "projection-audio-chunk",
+      "reason": "ipcRenderer channel used outside a captured api property (module-scope listener)"
+    },
+    {
+      "source": "Reference/LIVI/src/preload/index.ts",
+      "line": 43,
+      "name": "cluster-video-resolution",
+      "reason": "ipcRenderer channel used outside a captured api property (module-scope listener)"
+    },
+    {
+      "source": "Reference/LIVI/src/preload/index.ts",
+      "line": 48,
+      "name": "telemetry:update",
+      "reason": "ipcRenderer channel used outside a captured api property (module-scope listener)"
+    },
+    {
+      "source": "Reference/LIVI/src/preload/index.ts",
+      "line": 52,
+      "name": "projection-event",
+      "reason": "ipcRenderer channel used outside a captured api property (module-scope listener)"
+    },
+    {
+      "source": "Reference/carlife-vehicle-lib/CarLife-Android-Vehicle/src/com/baidu/carlifevehicle/util/CarlifeConfUtil.java",
+      "line": 38,
+      "name": "private static final String TAG = \"CarlifeConfUtil\";",
+      "reason": "not matched"
+    },
+    {
+      "source": "Reference/carlife-vehicle-lib/CarLife-Android-Vehicle/src/com/baidu/carlifevehicle/util/CarlifeConfUtil.java",
+      "line": 39,
+      "name": "private static final String CONF_FILE_DIR = \"/data/local/tmp\";",
+      "reason": "not matched"
+    },
+    {
+      "source": "Reference/carlife-vehicle-lib/CarLife-Android-Vehicle/src/com/baidu/carlifevehicle/util/CarlifeConfUtil.java",
+      "line": 40,
+      "name": "private static final String CONF_FILE = \"bdcf\";",
+      "reason": "not matched"
+    }
+  ],
+  "counts": {
+    "apollo.sdk.api": 406,
+    "apollo.sdk.property": 319,
+    "apollo.sdk.type": 70,
+    "carlife.dispatch": 60,
+    "carlife.dispatch.channel_case": 24,
+    "carlife.dispatch.default_branch": 4,
+    "carlife.local.const": 310,
+    "carlife.local.keycode_name_map": 38,
+    "carlife.local.namespace_alias": 6,
+    "carlife.upstream.const": 309,
+    "carlife.upstream.feature_key": 73,
+    "carlife.upstream.fun": 1,
+    "carlife.vehicle_lib.api": 414,
+    "carlife.vehicle_lib.callback_field": 56,
+    "carlife.vehicle_lib.ctor_dtor": 22,
+    "carlife.vehicle_lib.struct": 57,
+    "carlife.vehicle_lib.type": 21,
+    "livi.cp.driver_api": 144,
+    "livi.input_command": 16,
+    "livi.native.const": 18,
+    "livi.native.enum": 16,
+    "livi.native.enum_variant": 32,
+    "livi.native.fn": 77,
+    "livi.native.struct": 82,
+    "livi.preload.api": 70,
+    "livi.transport.field": 12,
+    "livi.transport.field_private": 4,
+    "livi.transport.member": 7,
+    "livi.transport.method": 16,
+    "livi.transport.method_private": 2,
+    "livi.transport.type": 1
+  }
+}

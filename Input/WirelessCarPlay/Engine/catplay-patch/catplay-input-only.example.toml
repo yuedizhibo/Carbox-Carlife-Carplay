@@ -1,0 +1,44 @@
+# Local-evaluation-only CatPlay wireless INPUT configuration.
+# Copy into an isolated staging directory as c2a.toml; do not install under
+# /etc or modify an existing service. Supply the AP password out of band.
+#
+# Start only with:
+#   ./catplay_c2a --cp-input-only
+# Never combine --cp-input-only with --cp-bridge.
+
+# Existing writable staging-local state directory. Create it before launch.
+persist_dir = "./state"
+debug = false
+
+[mfi]
+# The external MFi Auth 3.0 coprocessor self-test is permitted only on the
+# exact backend below. Remote/client/server backends and every other bus/address
+# are rejected before any gadget, I2C path, or MFi device action.
+selftest = true
+
+[mfi.i2c]
+bus_offset = 1
+dev_addr = 16 # 0x10
+timeout_ms = 100
+
+[bluetooth]
+enabled = true
+device = "hci0"
+name = "Zero2WCar"
+
+[wifi]
+# Existing hostapd AP interface. catplay_c2a does not configure this radio.
+enabled = true
+device = "wlan0"
+
+[wifi_network]
+ssid = "Zero2WCar"
+password = "SET_AP_PASSWORD_OUT_OF_BAND"
+wpa = true
+channel = 7
+
+[gadget]
+# Ignored by --cp-input-only. It is retained only because AppConfig parses a
+# complete file. Input-only never calls GadgetHelper or configfs/UDC APIs.
+enabled = false
+pinned = false

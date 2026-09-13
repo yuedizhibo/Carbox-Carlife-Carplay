@@ -1,0 +1,32 @@
+[Unit]
+Description=Zero2W real Wireless-CarPlay native sidecar (AP owner + control socket)
+Documentation=file:/root/zero2w/Input/WirelessCarPlay/Engine/README.md
+# The USB RNDIS debug link is the only way back into the board once wlan0
+# becomes an access point, so it is a hard requirement, not a preference.
+Requires=zero2w-usb-rndis.service
+After=network-online.target zero2w-usb-rndis.service zero2w-usb-dhcp.service bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/zero2w
+EnvironmentFile=/etc/zero2w/cp-native.env
+# Non-zero preflight (missing hostapd, dead debug link, refused MFi target)
+# keeps the radio untouched and the unit in a failed state.
+ExecStartPre=/root/zero2w/bin/cp-native preflight --env-file /etc/zero2w/cp-native.env
+ExecStart=/root/zero2w/bin/cp-native run --env-file /etc/zero2w/cp-native.env
+Restart=on-failure
+RestartSec=3
+# hostapd, dnsmasq and avahi are children of this unit; the default
+# control-group kill mode takes them down with it, so no orphan AP survives.
+KillMode=control-group
+MemoryMax=64M
+TasksMax=16
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+# ProtectSystem=strict is deliberately absent: the AP takeover writes
+# /etc/NetworkManager/conf.d and the configs live in /run/zero2w.
+
+[Install]
+WantedBy=multi-user.target

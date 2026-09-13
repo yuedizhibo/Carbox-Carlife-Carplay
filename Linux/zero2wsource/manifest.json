@@ -1,0 +1,331 @@
+{
+  "board": "Orange Pi Zero 2W (Allwinner H618 / sun50iw9p1, Mali-G31, AP6256, AXP313a, AC200 100M PHY)",
+  "generated": "2026-09-04T08:43:02.324Z",
+  "clone_mode": "git clone --depth 1 --single-branch -c core.protectNTFS=false",
+  "totals": {
+    "repos": 29,
+    "files": 390911,
+    "size_mb": 8685.3
+  },
+  "repos": [
+    {
+      "name": "arm-trusted-firmware-h616-bl31",
+      "path": "01-soc-h616-h618-boot-kernel/arm-trusted-firmware-h616-bl31",
+      "url": "https://github.com/ARM-software/arm-trusted-firmware.git",
+      "branch": "HEAD",
+      "commit": "4b9be5abfa8b1a7c7e00776da01768d3358e648a",
+      "shallow": true,
+      "files": 4607,
+      "size_mb": 47.8,
+      "purpose": "ATF，已 checkout 官方锁定 commit 4b9be5a…（PLAT=sun50i_h616 -> bl31.bin）"
+    },
+    {
+      "name": "linux-orangepi-5.4-sun50iw9",
+      "path": "01-soc-h616-h618-boot-kernel/linux-orangepi-5.4-sun50iw9",
+      "url": "https://github.com/orangepi-xunlong/linux-orangepi.git",
+      "branch": "orange-pi-5.4-sun50iw9",
+      "commit": "3a4a29414d558664847202f4d8919b8ab8bcf4a8",
+      "shallow": true,
+      "files": 70186,
+      "size_mb": 1196.8,
+      "purpose": "官方 current 内核(5.4.125)：全志厂商驱动库 bcmdhd / disp2 fbdev / sunxi_g2d / cedar-ve / axp2101 PMIC / TV-AC200"
+    },
+    {
+      "name": "linux-orangepi-6.1-sun50iw9",
+      "path": "01-soc-h616-h618-boot-kernel/linux-orangepi-6.1-sun50iw9",
+      "url": "https://github.com/orangepi-xunlong/linux-orangepi.git",
+      "branch": "orange-pi-6.1-sun50iw9",
+      "commit": "71144529b0334d1488624c41d0d3ba0cb03dd4c1",
+      "shallow": true,
+      "files": 83875,
+      "size_mb": 1693.8,
+      "purpose": "★官方 next 内核(Allwinner/OrangePi BSP 6.1.31)：含 sun50i-h618-orangepi-zero2w.dts、sunxi-ac200、sunxi-ephy、brcmfmac —— 内核定制主基线"
+    },
+    {
+      "name": "orangepi-build",
+      "path": "01-soc-h616-h618-boot-kernel/orangepi-build",
+      "url": "https://github.com/orangepi-xunlong/orangepi-build.git",
+      "branch": "next",
+      "commit": "bdba421984211da19191dc6ac6818a247817335f",
+      "shallow": true,
+      "files": 2368,
+      "size_mb": 691.4,
+      "purpose": "★官方构建系统(branch next)：内置 orangepizero2w；内核/uboot/ATF 分支映射、boot0/monitor blob、dragonsecboot 打包工具"
+    },
+    {
+      "name": "orangepi-zero2w-bootloader-community",
+      "path": "01-soc-h616-h618-boot-kernel/orangepi-zero2w-bootloader-community",
+      "url": "https://github.com/Aeternus-Security-OU/orangepi-zero-2w-bootloader.git",
+      "branch": "main",
+      "commit": "a0e28c2e3c29d3e3e2509de962cd4728bc5c9b03",
+      "shallow": true,
+      "files": 32,
+      "size_mb": 24.2,
+      "purpose": "社区 Zero2W 引导/打包仓库（boot0+u-boot 组合与烧写参考）"
+    },
+    {
+      "name": "sunxi-tools",
+      "path": "01-soc-h616-h618-boot-kernel/sunxi-tools",
+      "url": "https://github.com/linux-sunxi/sunxi-tools.git",
+      "branch": "master",
+      "commit": "d7bbd172a5da601a08f94479de308c6fb714a19a",
+      "shallow": true,
+      "files": 114,
+      "size_mb": 0.6,
+      "purpose": "主机端工具：sunxi-fel(救砖)、boot.scr/sunxi 相关工具"
+    },
+    {
+      "name": "u-boot-orangepi-v2018.05-h618",
+      "path": "01-soc-h616-h618-boot-kernel/u-boot-orangepi-v2018.05-h618",
+      "url": "https://github.com/orangepi-xunlong/u-boot-orangepi.git",
+      "branch": "v2018.05-h618",
+      "commit": "66e2615a13f7e2b3ee269fd0ec027db117c493b7",
+      "shallow": true,
+      "files": 13842,
+      "size_mb": 148.6,
+      "purpose": "官方 current 引导(BSP 2018.05)：orangepi_zero2w_defconfig（DRAM 由预编译 boot0 + fex dram_para 完成）"
+    },
+    {
+      "name": "u-boot-orangepi-v2018.05-sun50iw9",
+      "path": "01-soc-h616-h618-boot-kernel/u-boot-orangepi-v2018.05-sun50iw9",
+      "url": "https://github.com/orangepi-xunlong/u-boot-orangepi.git",
+      "branch": "v2018.05-sun50iw9",
+      "commit": "273096252caa7682773f9be91930c84dc91bf5ed",
+      "shallow": true,
+      "files": 13204,
+      "size_mb": 127.9,
+      "purpose": "同族更早的 sun50iw9 BSP u-boot（参考）"
+    },
+    {
+      "name": "u-boot-orangepi-v2024.01",
+      "path": "01-soc-h616-h618-boot-kernel/u-boot-orangepi-v2024.01",
+      "url": "https://github.com/orangepi-xunlong/u-boot-orangepi.git",
+      "branch": "v2024.01",
+      "commit": "a4d4b0e24e185e84dd02f06f53999a8effde86db",
+      "shallow": true,
+      "files": 20394,
+      "size_mb": 157.9,
+      "purpose": "官方 next 引导(全志 fork, 主线风格)：configs/orangepi_zero2w_defconfig + dram_sun50i_h616 + AXP313"
+    },
+    {
+      "name": "linux-mainline-master",
+      "path": "02-mainline-linux-uboot/linux-mainline-master",
+      "url": "https://github.com/torvalds/linux.git",
+      "branch": "master",
+      "commit": "bc35965f6940a9bf834d54187b6088b8eb09206d",
+      "shallow": true,
+      "files": 96042,
+      "size_mb": 1901.1,
+      "purpose": "主线内核：已有 zero2w dts，但缺 AP6256 SDIO 与 AC200 网口（见 HARDWARE.md 第11节）"
+    },
+    {
+      "name": "u-boot-mainline-master",
+      "path": "02-mainline-linux-uboot/u-boot-mainline-master",
+      "url": "https://github.com/u-boot/u-boot.git",
+      "branch": "main",
+      "commit": "cc557af4553382f6f50e3ed62b9577054e7bc54f",
+      "shallow": true,
+      "files": 38601,
+      "size_mb": 311.3,
+      "purpose": "主线 u-boot：orangepi_zero2w_defconfig（无需 ATF）"
+    },
+    {
+      "name": "linux-firmware-sparse",
+      "path": "03-wifi-bt-ap6256/linux-firmware-sparse",
+      "url": "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git",
+      "branch": "main",
+      "commit": "e981caea6ed33c48d25b7dbf473327dbd01df163",
+      "shallow": true,
+      "files": 174,
+      "size_mb": 795.2,
+      "purpose": "上游 linux-firmware，sparse 只检出 broadcom/cypress（对照/升级固件）"
+    },
+    {
+      "name": "orangepi-firmware",
+      "path": "03-wifi-bt-ap6256/orangepi-firmware",
+      "url": "https://github.com/orangepi-xunlong/firmware.git",
+      "branch": "master",
+      "commit": "db5e86200ae592c467c4cfa50ec0c66cbc40b158",
+      "shallow": true,
+      "files": 468,
+      "size_mb": 83.5,
+      "purpose": "★AP6256(BCM43455/43456) Wi-Fi 固件 + nvram_ap6256 + BT .hcd + aw87xxx 功放固件"
+    },
+    {
+      "name": "XPowersLib-axp313-regs",
+      "path": "04-pmic-axp313-ac200/XPowersLib-axp313-regs",
+      "url": "https://github.com/lewisxhe/XPowersLib.git",
+      "branch": "master",
+      "commit": "d6997586e68f65afd51baa775903df930db39821",
+      "shallow": true,
+      "files": 113,
+      "size_mb": 11.1,
+      "purpose": "X-Powers AXP313/AXP2101 寄存器级参考（调电源时序时查表）"
+    },
+    {
+      "name": "libcedarc-vpu",
+      "path": "05-gpu-mali-g31-display/libcedarc-vpu",
+      "url": "https://github.com/aodzip/libcedarc.git",
+      "branch": "master",
+      "commit": "e4246be521203adb2d93d52482239044a7f9b6fe",
+      "shallow": true,
+      "files": 489,
+      "size_mb": 78.6,
+      "purpose": "Allwinner Cedar 硬件视频解码库（用户态）"
+    },
+    {
+      "name": "mali-bifrost-h616",
+      "path": "05-gpu-mali-g31-display/mali-bifrost-h616",
+      "url": "https://github.com/wjrsonic/mali-bifrost-h616.git",
+      "branch": "main",
+      "commit": "0f8ec33d91742e21902effaaaff459f5de37270f",
+      "shallow": true,
+      "files": 450,
+      "size_mb": 6.3,
+      "purpose": "Arm Mali-G31(Bifrost) 闭源 DRM 内核驱动的 H616 移植"
+    },
+    {
+      "name": "sunxi-g2d",
+      "path": "05-gpu-mali-g31-display/sunxi-g2d",
+      "url": "https://github.com/cheofusi/sunxi-g2d.git",
+      "branch": "main",
+      "commit": "77a50a4ced54e1f77f6f5cb7fe0f8364a6d9b899",
+      "shallow": true,
+      "files": 40,
+      "size_mb": 0.1,
+      "purpose": "全志 G2D 2D 加速接口参考"
+    },
+    {
+      "name": "armbian-build",
+      "path": "06-build-system-rootfs/armbian-build",
+      "url": "https://github.com/armbian/build.git",
+      "branch": "main",
+      "commit": "96d652a9e2a549b757a7681c380bae70b48db3d3",
+      "shallow": true,
+      "files": 9219,
+      "size_mb": 270.5,
+      "purpose": "Armbian：主线内核/u-boot 板级配置与 patch 组织方式参考"
+    },
+    {
+      "name": "buildroot",
+      "path": "06-build-system-rootfs/buildroot",
+      "url": "https://github.com/buildroot/buildroot.git",
+      "branch": "master",
+      "commit": "c05de97a2bfe51d5d85e3071df3be7eec61a8375",
+      "shallow": true,
+      "files": 15219,
+      "size_mb": 32.4,
+      "purpose": "Buildroot：做极简可复现 rootfs"
+    },
+    {
+      "name": "Buildroot-YuzukiSBC",
+      "path": "06-build-system-rootfs/Buildroot-YuzukiSBC",
+      "url": "https://github.com/YuzukiHD/Buildroot-YuzukiSBC.git",
+      "branch": "master",
+      "commit": "377bdb4dea6c4dddd642c0404081725b47a8bdb4",
+      "shallow": true,
+      "files": 13082,
+      "size_mb": 115.9,
+      "purpose": "社区 buildroot 配置集（含 H616/H618 类板子）"
+    },
+    {
+      "name": "OrangePi_Build-legacy",
+      "path": "06-build-system-rootfs/OrangePi_Build-legacy",
+      "url": "https://github.com/orangepi-xunlong/OrangePi_Build.git",
+      "branch": "master",
+      "commit": "9cc4d8d18a9cb72ff7f33dc52d41f02991061863",
+      "shallow": true,
+      "files": 41,
+      "size_mb": 0.1,
+      "purpose": "老一代官方构建系统（参考）"
+    },
+    {
+      "name": "orangepi-external",
+      "path": "06-build-system-rootfs/orangepi-external",
+      "url": "https://github.com/orangepi-xunlong/external.git",
+      "branch": "master",
+      "commit": "e462137f8c68614e45b3ec73820cbc052d2008fc",
+      "shallow": true,
+      "files": 638,
+      "size_mb": 109.9,
+      "purpose": "OrangePi Linux SDK external（旧，含部分驱动/工具）"
+    },
+    {
+      "name": "orangepi-scripts",
+      "path": "06-build-system-rootfs/orangepi-scripts",
+      "url": "https://github.com/orangepi-xunlong/scripts.git",
+      "branch": "master",
+      "commit": "aa95623d37cb60a71e8e27603d96a9da1c379542",
+      "shallow": true,
+      "files": 34,
+      "size_mb": 0.1,
+      "purpose": "OrangePi Linux SDK 构建脚本（旧）"
+    },
+    {
+      "name": "wiringOP",
+      "path": "07-userspace-hal/wiringOP",
+      "url": "https://github.com/orangepi-xunlong/wiringOP.git",
+      "branch": "next",
+      "commit": "a7921ca2f5c124203be10d3418db70a2e15f3c10",
+      "shallow": true,
+      "files": 240,
+      "size_mb": 1.5,
+      "purpose": "OrangePi 用户态 GPIO/UART/I2C/SPI/PWM 库（wiringPi 分支）"
+    },
+    {
+      "name": "wiringOP-Python",
+      "path": "07-userspace-hal/wiringOP-Python",
+      "url": "https://github.com/orangepi-xunlong/wiringOP-Python.git",
+      "branch": "master",
+      "commit": "98a3e6622203af00dfbd20d625557a2d37266ff8",
+      "shallow": true,
+      "files": 69,
+      "size_mb": 0.1,
+      "purpose": "wiringOP 的 Python 绑定"
+    },
+    {
+      "name": "opi-documentation",
+      "path": "08-docs-datasheets/opi-documentation",
+      "url": "https://github.com/orangepi-xunlong/opi-documentation.git",
+      "branch": "master",
+      "commit": "6f5192f7c9021b7ae19ebb937b3035a782508501",
+      "shallow": true,
+      "files": 115,
+      "size_mb": 22.6,
+      "purpose": "OrangePi 文档仓库（旧板子为主）"
+    },
+    {
+      "name": "gcc-aarch64-linux-gnu-6.3",
+      "path": "09-toolchain/gcc-aarch64-linux-gnu-6.3",
+      "url": "https://github.com/orangepi-xunlong/toolchain.git",
+      "branch": "aarch64-linux-gnu-6.3",
+      "commit": "1d74de505e464ca1c21789885c46f280c9cd8ab9",
+      "shallow": true,
+      "files": 7185,
+      "size_mb": 855.7,
+      "purpose": "OrangePi 官方工具链仓分支（linaro aarch64 6.3.1 tarball）"
+    },
+    {
+      "name": "opi-zero3-i2s-5.4",
+      "path": "10-community-h616-h618/opi-zero3-i2s-5.4",
+      "url": "https://github.com/elkoni/Opi_Zero_3_I2S3_5.4.git",
+      "branch": "main",
+      "commit": "8bc84b62ffa909789eaedc140033abff82876588",
+      "shallow": true,
+      "files": 35,
+      "size_mb": 0.2,
+      "purpose": "社区补丁：H618 I2S3 音频（5.4/current）"
+    },
+    {
+      "name": "opi-zero3-i2s-6.1",
+      "path": "10-community-h616-h618/opi-zero3-i2s-6.1",
+      "url": "https://github.com/elkoni/Opi_Zero_3_I2S3_6.1.git",
+      "branch": "main",
+      "commit": "1d52026a2276f3ce9200f42454c5952217562a7b",
+      "shallow": true,
+      "files": 35,
+      "size_mb": 0.1,
+      "purpose": "社区补丁：H618 I2S3 音频（6.1/next）"
+    }
+  ]
+}

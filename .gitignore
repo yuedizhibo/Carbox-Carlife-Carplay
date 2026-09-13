@@ -1,0 +1,64 @@
+# Temporary workspace (keep policy files only)
+/Temp/*
+!/Temp/README.md
+!/Temp/.gitkeep
+
+# Pi coding harness state
+/.pi/
+/.pi-*
+/.scout-*
+
+# Build products and diagnostics
+**/build/
+**/out/
+**/target/
+**/build-out/
+**/build-out-*/
+
+# This directory contains durable build entry points, not only artifacts.
+!/Input/WirelessCarPlay/Engine/build/
+!/Input/WirelessCarPlay/Engine/build/*.sh
+!/Input/WirelessCarPlay/Engine/build/*.c
+/Input/WirelessCarPlay/Engine/build/artifacts/
+/Input/WirelessCarPlay/Engine/build/board-staging/
+*.log
+*.tmp
+*.pid
+*.exit
+*.status
+*.core
+
+# Media captures and firmware/image artifacts
+*.img
+*.raw
+*.h264
+*.cpmf
+*.pcap
+*.pcapng
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Downloaded Linux BSP/toolchain/vendor repositories. Recreate from manifest.json.
+/Linux/zero2wsource/01-soc-h616-h618-boot-kernel/
+/Linux/zero2wsource/02-mainline-linux-uboot/
+/Linux/zero2wsource/03-wifi-bt-ap6256/
+/Linux/zero2wsource/04-pmic-axp313-ac200/
+/Linux/zero2wsource/05-gpu-mali-g31-display/
+/Linux/zero2wsource/06-build-system-rootfs/
+/Linux/zero2wsource/07-userspace-hal/
+/Linux/zero2wsource/08-docs-datasheets/
+/Linux/zero2wsource/09-toolchain/
+/Linux/zero2wsource/10-community-h616-h618/
+
+# Local flashing/downloaded tool binaries (not reproducible from manifest.json)
+/Linux/zero2wsource/tools/*.exe
+/Linux/zero2wsource/tools/*.exe.sha256
+
+# Local-only reference material: third-party repos plus the upstream CatPlay
+# baseline now moved here. Their own Git metadata is authoritative and they are
+# deliberately not published with this repository.
+/Reference/

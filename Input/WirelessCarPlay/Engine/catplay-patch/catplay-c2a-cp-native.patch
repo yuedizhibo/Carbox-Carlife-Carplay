@@ -1,0 +1,2504 @@
+diff --git a/async/catplay_tokio/src/tcp/tcp_bind.rs b/async/catplay_tokio/src/tcp/tcp_bind.rs
+index eaf824b..61a8068 100644
+--- a/async/catplay_tokio/src/tcp/tcp_bind.rs
++++ b/async/catplay_tokio/src/tcp/tcp_bind.rs
+@@ -138,7 +138,7 @@ pub fn bind_iface_ipv4(port: u16, iface: &str) -> io::Result<TcpListener> {
+             sin_family: AF_INET as _,
+             sin_port: port.to_be(),
+             sin_addr: in_addr { s_addr: 0 },
+-            sin_zero: [0u8; _],
++            sin_zero: [0u8; 8],
+         };
+ 
+         if bind(fd, &addr as *const _ as *const sockaddr, std::mem::size_of::<sockaddr_in6>() as u32) != 0 {
+diff --git a/c2a/catplay_c2a/Cargo.toml b/c2a/catplay_c2a/Cargo.toml
+index 15a89be..dc3a6ad 100644
+--- a/c2a/catplay_c2a/Cargo.toml
++++ b/c2a/catplay_c2a/Cargo.toml
+@@ -42,12 +42,13 @@ catplay_fb = { path = "../catplay_fb" }
+ #####
+ 
+ serde = { version = "1.0.219", default-features = false, features = ["derive"] }
++serde_json = { version = "1.0.145", default-features = false, features = ["std"] }
+ toml = { version = "0.9.11", default-features = false, features = [
+     "parse",
+     "serde",
+ ] }
+ uuid = { version = "1.17.0", default-features = false, features = ["v5"] }
+-tokio = { version = "1.48.0", features = ["rt", "signal"] }
++tokio = { version = "1.48.0", features = ["rt", "signal", "net", "io-util", "time", "macros"] }
+ futures = "0.3.31"
+ if-addrs = "0.14.0"
+ async-trait = "0.1.89"
+diff --git a/c2a/catplay_c2a/src/audiov2/audio_proxy.rs b/c2a/catplay_c2a/src/audiov2/audio_proxy.rs
+index 536deb6..f87e1f4 100644
+--- a/c2a/catplay_c2a/src/audiov2/audio_proxy.rs
++++ b/c2a/catplay_c2a/src/audiov2/audio_proxy.rs
+@@ -1,14 +1,14 @@
+ use std::time::Duration;
+ 
+ use catplay_carplay::{
+-    audio::{AudioPlayerBox, AudioRecorderBox, AudioStreamBasicDescription},
++    audio::{AudioCodec, AudioFormatFlags, AudioPlayerBox, AudioRecorderBox, AudioStreamBasicDescription},
+     carplay_tx::{AirPlayTransmitter, AirPlayTransmitterProxyRef},
+     msg::{AudioFormat, AudioType, StreamType},
+     rtsp_frame::{RtspError, RtspResult},
+ };
+ use log::{debug, error};
+ 
+-use crate::proxy::pcm_proxy::PcmProxyPlayer;
++use crate::{MediaTap, media_ipc::AudioMeta, proxy::pcm_proxy::PcmProxyPlayer};
+ 
+ pub struct AudioProxyUtil;
+ 
+@@ -21,18 +21,28 @@ impl AudioProxyUtil {
+         audio_format: AudioFormat,
+         pcm_format: AudioStreamBasicDescription,
+         duplex: bool,
++        media: MediaTap,
+     ) -> RtspResult<(AudioPlayerBox<i16>, Option<AudioRecorderBox<i16>>)> {
+         debug!(
+             "Starting stream {stream_type:?} with {audio_format:?}; mapped pcm is {:?}",
+             AudioFormat::try_from(pcm_format)
+         );
++        let negotiated_audio_format = audio_format;
+         let audio_format = AudioFormat::try_from(pcm_format).map_err(|_| RtspError::Unknown)?;
++        if !matches!(pcm_format.sample_rate, 8000 | 16000 | 24000 | 32000 | 44100 | 48000)
++            || !matches!(pcm_format.channels_per_frame, 1 | 2)
++            || pcm_format.format != AudioCodec::LinearPcm
++            || !pcm_format.format_flags.contains(AudioFormatFlags::IS_SIGNED_INT)
++            || pcm_format.format_flags.intersects(AudioFormatFlags::IS_FLOAT | AudioFormatFlags::IS_NON_INTERLEAVED)
++            || pcm_format.bits_per_channel != 16
++            || pcm_format.bytes_per_frame != pcm_format.channels_per_frame * 2 { return Err(RtspError::Unknown); }
+ 
+         // Open a proxy audio stream towards the car
+ 
+         let rate = pcm_format.sample_rate;
+ 
+-        let audio_pair = PcmProxyPlayer::pair(rate, pcm_format.channels_per_frame as _);
++        let audio_tap = media.audio_stream(AudioMeta { stream_type, audio_type, audio_format: negotiated_audio_format, pcm: pcm_format, latency_us: _latency.as_micros().min(u32::MAX as u128) as u32, duplex });
++        let audio_pair = PcmProxyPlayer::pair_with_tap(rate, pcm_format.channels_per_frame as _, audio_tap);
+         let mut mic_player = None;
+         let mut pending_mic = None;
+ 
+diff --git a/c2a/catplay_c2a/src/cp_output_manager.rs b/c2a/catplay_c2a/src/cp_output_manager.rs
+index 6fa9a6e..60a02f9 100644
+--- a/c2a/catplay_c2a/src/cp_output_manager.rs
++++ b/c2a/catplay_c2a/src/cp_output_manager.rs
+@@ -2,7 +2,7 @@ use std::{error::Error, path::PathBuf};
+ 
+ use log::info;
+ 
+-use crate::{AppConfig, HomeKitManager, MfiManager, ProdGadget, ProdGadgetConfig};
++use crate::{AppConfig, HomeKitManager, MediaTap, MfiManager, ProdGadget, ProdGadgetConfig};
+ use catplay_util::{EventReconciler, EventSleeper, Reconciler};
+ 
+ #[derive(EventSleeper, EventReconciler)]
+@@ -12,15 +12,11 @@ pub struct CarPlayOutputManager {
+     #[sleep]
+     #[reconcile]
+     gadget_manager: Option<Reconciler<ProdGadget>>,
++    media: MediaTap,
+ }
+ 
+ impl CarPlayOutputManager {
+-    pub fn new() -> Self {
+-        Self {
+-            enabled: false,
+-            gadget_manager: None,
+-        }
+-    }
++    pub fn new(media: MediaTap) -> Self { Self { enabled: false, gadget_manager: None, media } }
+ 
+     pub fn start(&mut self, config: &AppConfig, _mfi: &MfiManager, homekit: &HomeKitManager) -> Result<(), Box<dyn Error>> {
+         let gadget = &config.gadget;
+@@ -57,6 +53,7 @@ impl CarPlayOutputManager {
+             passphrase: config.wifi_network.password,
+             bt_cache_file: bt_cache_file.to_str().expect("corrupted file path").into(),
+             persist_dir,
++            media: self.media.clone(),
+         };
+         let g = ProdGadget::new(cfg);
+         info!("GadgetManager output configured");
+@@ -65,4 +62,11 @@ impl CarPlayOutputManager {
+         self.enabled = true;
+         Ok(())
+     }
++
++    pub fn telemetry_snapshot(&mut self) -> crate::TelemetrySnapshot {
++        self.gadget_manager
++            .as_mut()
++            .map(|gadget| gadget.child_mut().telemetry_snapshot())
++            .unwrap_or_else(crate::TelemetrySnapshot::initial)
++    }
+ }
+diff --git a/c2a/catplay_c2a/src/lib.rs b/c2a/catplay_c2a/src/lib.rs
+index 36fa56c..9c383f8 100644
+--- a/c2a/catplay_c2a/src/lib.rs
++++ b/c2a/catplay_c2a/src/lib.rs
+@@ -1,3 +1,5 @@
++#![recursion_limit = "256"]
++
+ mod config;
+ mod cp_output_manager;
+ mod homekit_manager;
+@@ -5,6 +7,8 @@ mod main_init;
+ mod mfi_manager;
+ mod prod_gadget;
+ pub mod proxy;
++mod telemetry;
++mod media_ipc;
+ mod ui;
+ 
+ pub mod audiov2;
+@@ -15,5 +19,7 @@ pub use homekit_manager::*;
+ pub use main_init::*;
+ pub use mfi_manager::*;
+ pub use prod_gadget::*;
++pub use telemetry::*;
++pub use media_ipc::{MediaServer, MediaTap};
+ 
+ pub mod proxy_rpc;
+diff --git a/c2a/catplay_c2a/src/main.rs b/c2a/catplay_c2a/src/main.rs
+index a959e95..da5bbd7 100644
+--- a/c2a/catplay_c2a/src/main.rs
++++ b/c2a/catplay_c2a/src/main.rs
+@@ -1,5 +1,21 @@
++#![recursion_limit = "256"]
++
+ use std::process::exit;
+ 
++// This reports support only. Live readiness is published by the engine-owned
++// CP_TELEMETRY_SOCKET listener after the normal reconciler has observed it.
++fn cp_native_capabilities() -> Option<i32> {
++    if !std::env::args().any(|arg| arg == "--cp-capabilities-json") {
++        return None;
++    }
++    let socket = std::env::var("CP_TELEMETRY_SOCKET").unwrap_or_else(|_| "/run/zero2w/catplay.sock".into());
++    println!(
++        "{{\"schema_version\":1,\"engine\":\"catplay\",\"listener_ready\":false,\"wireless_input\":true,\"wired_output\":true,\"telemetry_socket\":{}}}",
++        serde_json::to_string(&socket).expect("socket path must serialize"),
++    );
++    Some(0)
++}
++
+ use catplay_c2a::Main;
+ use catplay_tracing::logger::{AsyncLogger, setup_prod_logger};
+ use catplay_tracing::tracer::SessionTracer;
+@@ -38,6 +54,10 @@ fn disable_jemalloc_thread_cache() {
+ 
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() {
++    if let Some(code) = cp_native_capabilities() {
++        exit(code);
++    }
++
+     #[cfg(feature = "jemalloc")]
+     disable_jemalloc_thread_cache();
+ 
+diff --git a/c2a/catplay_c2a/src/main_init.rs b/c2a/catplay_c2a/src/main_init.rs
+index 2b3d0a2..1824b03 100644
+--- a/c2a/catplay_c2a/src/main_init.rs
++++ b/c2a/catplay_c2a/src/main_init.rs
+@@ -1,10 +1,10 @@
+-use std::{error::Error, fs};
++use std::{error::Error, fs, time::Duration};
+ 
+-use crate::{AppConfig, CarPlayOutputManager, HomeKitManager, MfiManager};
++use crate::{AppConfig, CarPlayOutputManager, HomeKitManager, MediaServer, MediaTap, MfiManager, TelemetryServer};
+ use catplay_iap2_usb_gadget::gadget::GadgetHelper;
+ use catplay_util::{EventReconciler, EventSleeper};
+ use log::error;
+-use tokio::signal;
++use tokio::{signal, time::{interval, MissedTickBehavior}};
+ 
+ fn parse_config(path: String) -> Result<AppConfig, String> {
+     let config_str: String = fs::read_to_string(path).map_err(|err| format!("Failed to read config file: {}", err))?;
+@@ -22,6 +22,7 @@ pub struct Main {
+     homekit: Option<HomeKitManager>,
+     // input: Option<CarPlayInputManager>,
+     output: Option<CarPlayOutputManager>,
++    telemetry: TelemetryServer,
+ }
+ 
+ async fn wait_forever() -> Result<(), Box<dyn Error>> {
+@@ -49,14 +50,23 @@ impl Main {
+         let mut homekit = HomeKitManager::default();
+         homekit.start(&config, &mfi)?;
+ 
+-        let mut output = CarPlayOutputManager::new();
++        let (mut media, media_tap) = MediaTap::new();
++        let mut output = CarPlayOutputManager::new(media_tap);
+         output.start(&config, &mfi, &homekit)?;
++        let telemetry = TelemetryServer::bind_from_env()?;
++
++        tokio::spawn(async move {
++            let mut tick = interval(Duration::from_millis(3));
++            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            loop { tick.tick().await; media.service_once(); }
++        });
+ 
+         Ok(Main {
+             mfi: Some(mfi),
+             homekit: Some(homekit),
+             // input: Some(input),
+             output: Some(output),
++            telemetry,
+         })
+     }
+ 
+@@ -64,6 +74,7 @@ impl Main {
+         loop {
+             let output = self.output.as_mut().unwrap();
+             let _ = output.reconcile().await;
++            self.telemetry.publish(&output.telemetry_snapshot())?;
+             output.sleep().await;
+         }
+ 
+diff --git a/c2a/catplay_c2a/src/media_ipc.rs b/c2a/catplay_c2a/src/media_ipc.rs
+new file mode 100644
+index 0000000..f4a6b6a
+--- /dev/null
++++ b/c2a/catplay_c2a/src/media_ipc.rs
+@@ -0,0 +1,1229 @@
++use std::{
++    collections::VecDeque,
++    fs,
++    io::{self, ErrorKind, Read, Write},
++    os::unix::{
++        fs::{FileTypeExt, MetadataExt, PermissionsExt},
++        io::AsRawFd,
++        net::{UnixListener, UnixStream},
++    },
++    path::{Path, PathBuf},
++    sync::{
++        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
++        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
++        Arc, Mutex,
++    },
++    time::{Duration, Instant},
++};
++
++use catplay_carplay::{
++    audio::{AudioCodec, AudioStreamBasicDescription},
++    carplay_rx::AirPlayReceiverHandleRef,
++    msg::{AudioFormat, AudioType, StreamType},
++    video::{AvccConfigExtended, EncodedVideoFrame},
++};
++use log::warn;
++
++const SOCKET: &str = "/run/zero2w/catplay-media-v1.sock";
++const HEADER: usize = 64;
++const MAX_PAYLOAD: usize = 1_048_576;
++const MAX_CONFIG: usize = 65_536;
++const MAX_AUDIO: usize = 3_840;
++const VIDEO_CAP: usize = 2;
++const AUDIO_CAP: usize = 8;
++const CONTROL_CAP: usize = 16;
++const HEARTBEAT: Duration = Duration::from_secs(1);
++const WRITE_DEADLINE: Duration = Duration::from_millis(100);
++const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
++const MAX_ACCEPTS_PER_SERVICE: usize = 2;
++const MAX_CONTROL_PER_SERVICE: usize = 4;
++const MAX_VIDEO_PER_SERVICE: usize = 1;
++const MAX_AUDIO_PER_SERVICE: usize = 1;
++/// At a 3 ms current-thread cadence this limits a healthy consumer write offer to 64 KiB.
++const MAX_WRITE_BYTES_PER_SERVICE: usize = 64 * 1024;
++
++const SESSION_BEGIN: u16 = 0x0003;
++const SESSION_END: u16 = 0x0004;
++const VIDEO_START: u16 = 0x0010;
++const VIDEO_CONFIG: u16 = 0x0011;
++const VIDEO_FRAME: u16 = 0x0012;
++const VIDEO_END: u16 = 0x0013;
++const AUDIO_START: u16 = 0x0020;
++const AUDIO_CHUNK: u16 = 0x0021;
++const AUDIO_END: u16 = 0x0022;
++const SERVER_HELLO: u16 = 0x0001;
++const HEARTBEAT_RECORD: u16 = 0x0002;
++const REQUEST_KEYFRAME: u16 = 0x8001;
++const KEYFRAME: u16 = 1;
++const DISCONTINUITY: u16 = 2;
++
++#[derive(Clone)]
++pub struct MediaTap {
++    inner: Arc<Inner>,
++}
++pub struct VideoTap {
++    tap: MediaTap,
++    session: u64,
++    stream: u32,
++    sequence: AtomicU64,
++    config_id: AtomicU32,
++}
++pub struct AudioTap {
++    tap: MediaTap,
++    session: u64,
++    stream: u32,
++    sequence: AtomicU64,
++    meta: AudioMeta,
++    ended: AtomicBool,
++}
++#[derive(Clone, Copy)]
++pub struct AudioMeta {
++    pub stream_type: StreamType,
++    pub audio_type: AudioType,
++    pub audio_format: AudioFormat,
++    pub pcm: AudioStreamBasicDescription,
++    pub latency_us: u32,
++    pub duplex: bool,
++}
++
++enum Control {
++    SessionBegin(u64),
++    SessionEnd(u64, u32),
++    VideoStart(u64, u32),
++    VideoConfig(u64, u32, u32, AvccConfigExtended),
++    VideoEnd(u64, u32, u32),
++    AudioStart(u64, u32, AudioMeta),
++    AudioEnd(u64, u32, u32),
++}
++struct Video {
++    session: u64,
++    stream: u32,
++    sequence: u64,
++    config: u32,
++    frame: EncodedVideoFrame,
++    discontinuity: bool,
++}
++struct Audio {
++    session: u64,
++    stream: u32,
++    sequence: u64,
++    meta: AudioMeta,
++    samples: Vec<i16>,
++    discontinuity: bool,
++}
++struct Inner {
++    control: SyncSender<Control>,
++    control_rx: Mutex<Receiver<Control>>,
++    control_count: AtomicUsize,
++    video: SyncSender<Video>,
++    video_rx: Mutex<Receiver<Video>>,
++    video_count: AtomicUsize,
++    audio: SyncSender<Audio>,
++    audio_rx: Mutex<Receiver<Audio>>,
++    audio_count: AtomicUsize,
++    connected: AtomicBool,
++    fatal: AtomicBool,
++    session: AtomicU64,
++    next_stream: AtomicU32,
++    handle: Mutex<Option<AirPlayReceiverHandleRef>>,
++    last_keyframe: Mutex<Instant>,
++}
++
++impl MediaTap {
++    pub fn new() -> (MediaServer, Self) {
++        let (control, control_rx) = mpsc::sync_channel(CONTROL_CAP);
++        let (video, video_rx) = mpsc::sync_channel(VIDEO_CAP);
++        let (audio, audio_rx) = mpsc::sync_channel(AUDIO_CAP);
++        let inner = Arc::new(Inner {
++            control,
++            control_rx: Mutex::new(control_rx),
++            control_count: AtomicUsize::new(0),
++            video,
++            video_rx: Mutex::new(video_rx),
++            video_count: AtomicUsize::new(0),
++            audio,
++            audio_rx: Mutex::new(audio_rx),
++            audio_count: AtomicUsize::new(0),
++            connected: AtomicBool::new(false),
++            fatal: AtomicBool::new(false),
++            session: AtomicU64::new(0),
++            next_stream: AtomicU32::new(1),
++            handle: Mutex::new(None),
++            last_keyframe: Mutex::new(Instant::now() - KEYFRAME_INTERVAL),
++        });
++        (
++            MediaServer::bind_from_env(inner.clone()).expect("media socket bind failed"),
++            Self { inner },
++        )
++    }
++    fn control(&self, event: Control) {
++        if self
++            .inner
++            .control_count
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < CONTROL_CAP).then_some(n + 1))
++            .is_err()
++        {
++            self.inner.fatal.store(true, Ordering::Release);
++            return;
++        }
++        if self.inner.control.try_send(event).is_err() {
++            self.inner.control_count.fetch_sub(1, Ordering::AcqRel);
++            self.inner.fatal.store(true, Ordering::Release);
++        }
++    }
++    pub fn begin_session(&self, handle: AirPlayReceiverHandleRef) {
++        let id = self.inner.session.fetch_add(1, Ordering::AcqRel) + 1;
++        *self.inner.handle.lock().unwrap() = Some(handle);
++        self.control(Control::SessionBegin(id));
++    }
++    pub fn end_session(&self, reason: u32) {
++        let id = self.inner.session.load(Ordering::Acquire);
++        if id != 0 {
++            self.control(Control::SessionEnd(id, reason));
++        }
++        *self.inner.handle.lock().unwrap() = None;
++    }
++    pub fn video_stream(&self) -> VideoTap {
++        let session = self.inner.session.load(Ordering::Acquire);
++        let stream = self.inner.next_stream.fetch_add(1, Ordering::AcqRel);
++        self.control(Control::VideoStart(session, stream));
++        VideoTap {
++            tap: self.clone(),
++            session,
++            stream,
++            sequence: AtomicU64::new(0),
++            config_id: AtomicU32::new(0),
++        }
++    }
++    pub fn audio_stream(&self, meta: AudioMeta) -> AudioTap {
++        let session = self.inner.session.load(Ordering::Acquire);
++        let stream = self.inner.next_stream.fetch_add(1, Ordering::AcqRel);
++        self.control(Control::AudioStart(session, stream, meta));
++        AudioTap {
++            tap: self.clone(),
++            session,
++            stream,
++            sequence: AtomicU64::new(0),
++            meta,
++            ended: AtomicBool::new(false),
++        }
++    }
++    fn request_keyframe(&self) {
++        let mut last = self.inner.last_keyframe.lock().unwrap();
++        if last.elapsed() >= KEYFRAME_INTERVAL {
++            if let Some(handle) = self.inner.handle.lock().unwrap().as_ref() {
++                handle.request_keyframe();
++                *last = Instant::now();
++            }
++        }
++    }
++}
++impl VideoTap {
++    pub fn config(&self, config: AvccConfigExtended) {
++        if !valid_config(&config.avcc.sps_pps) {
++            self.tap.request_keyframe();
++            return;
++        }
++        let id = self.config_id.fetch_add(1, Ordering::AcqRel) + 1;
++        self.tap.control(Control::VideoConfig(self.session, self.stream, id, config));
++    }
++    pub fn frame(&self, frame: &EncodedVideoFrame) {
++        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
++        if !self.tap.inner.connected.load(Ordering::Acquire) {
++            return;
++        }
++        if frame.data.len() > MAX_PAYLOAD
++            || frame.width == 0
++            || frame.height == 0
++            || frame.width > 4096
++            || frame.height > 4096
++            || (frame.width as u64 * frame.height as u64) > 8_847_360
++        {
++            self.tap.request_keyframe();
++            return;
++        }
++        if self
++            .tap
++            .inner
++            .video_count
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < VIDEO_CAP).then_some(n + 1))
++            .is_err()
++        {
++            self.tap.request_keyframe();
++            return;
++        }
++        let event = Video {
++            session: self.session,
++            stream: self.stream,
++            sequence,
++            config: self.config_id.load(Ordering::Acquire),
++            frame: frame.clone(),
++            discontinuity: false,
++        };
++        if self.tap.inner.video.try_send(event).is_err() {
++            self.tap.inner.video_count.fetch_sub(1, Ordering::AcqRel);
++            self.tap.request_keyframe();
++        }
++    }
++}
++impl Drop for VideoTap {
++    fn drop(&mut self) {
++        self.tap.control(Control::VideoEnd(self.session, self.stream, 0));
++    }
++}
++impl AudioTap {
++    pub fn samples(&self, buf: &[i16]) {
++        let max_frames = self.meta.pcm.sample_rate as usize / 50;
++        let channels = self.meta.pcm.channels_per_frame as usize;
++        if channels == 0 {
++            return;
++        }
++        for chunk in buf.chunks(max_frames.saturating_mul(channels).max(channels)) {
++            let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
++            if !self.tap.inner.connected.load(Ordering::Acquire) || chunk.len() * 2 > MAX_AUDIO {
++                continue;
++            }
++            if self
++                .tap
++                .inner
++                .audio_count
++                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < AUDIO_CAP).then_some(n + 1))
++                .is_err()
++            {
++                continue;
++            }
++            let event = Audio {
++                session: self.session,
++                stream: self.stream,
++                sequence,
++                meta: self.meta,
++                samples: chunk.to_vec(),
++                discontinuity: false,
++            };
++            if self.tap.inner.audio.try_send(event).is_err() {
++                self.tap.inner.audio_count.fetch_sub(1, Ordering::AcqRel);
++            }
++        }
++    }
++    pub fn end(&self, reason: u32) {
++        if !self.ended.swap(true, Ordering::AcqRel) {
++            self.tap.control(Control::AudioEnd(self.session, self.stream, reason));
++        }
++    }
++}
++impl Drop for AudioTap {
++    fn drop(&mut self) {
++        self.end(0);
++    }
++}
++
++pub struct MediaServer {
++    listener: UnixListener,
++    path: PathBuf,
++    dev: u64,
++    ino: u64,
++    inner: Arc<Inner>,
++    client: Option<Client>,
++    state: Snapshot,
++    last_heartbeat: Instant,
++    prefer_audio: bool,
++    #[cfg(test)]
++    last_request: Option<(u64, u32)>,
++}
++trait ClientIo: Read + Write + Send {}
++impl<T: Read + Write + Send> ClientIo for T {}
++struct Client {
++    io: Box<dyn ClientIo>,
++    pending: Option<Pending>,
++    queue: VecDeque<Vec<u8>>,
++    read: Vec<u8>,
++    eagain: u8,
++}
++struct Pending {
++    data: Vec<u8>,
++    at: usize,
++    started: Instant,
++}
++#[derive(Default)]
++struct Snapshot {
++    session: u64,
++    video: Option<(u32, u32, Vec<u8>, u32, u32)>,
++    audio: Vec<(u32, AudioMeta)>,
++}
++impl MediaServer {
++    fn bind_from_env(inner: Arc<Inner>) -> io::Result<Self> {
++        let path = std::env::var_os("CP_CATPLAY_MEDIA_SOCKET")
++            .map(PathBuf::from)
++            .unwrap_or_else(|| PathBuf::from(SOCKET));
++        prepare(&path)?;
++        let listener = UnixListener::bind(&path)?;
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
++        listener.set_nonblocking(true)?;
++        let m = fs::symlink_metadata(&path)?;
++        Ok(Self {
++            listener,
++            path,
++            dev: m.dev(),
++            ino: m.ino(),
++            inner,
++            client: None,
++            state: Snapshot::default(),
++            last_heartbeat: Instant::now(),
++            prefer_audio: false,
++            #[cfg(test)]
++            last_request: None,
++        })
++    }
++    pub fn service_once(&mut self) {
++        if self.inner.fatal.swap(false, Ordering::AcqRel) {
++            self.close();
++        }
++        self.accept();
++        self.read_request();
++        self.drain();
++        if self.client.is_some() && self.last_heartbeat.elapsed() >= HEARTBEAT {
++            self.enqueue(record(HEARTBEAT_RECORD, 0, self.state.session, 0, 0, monotonic_us(), &[], [0; 4]));
++            self.last_heartbeat = Instant::now();
++        }
++        self.flush();
++    }
++    fn accept(&mut self) {
++        for _ in 0..MAX_ACCEPTS_PER_SERVICE {
++            match self.listener.accept() {
++                Ok((stream, _)) => {
++                    if self.client.is_some()
++                        || !accepts_peer_uid(peer_uid(&stream).ok(), unsafe { libc::geteuid() })
++                        || stream.set_nonblocking(true).is_err()
++                    {
++                        continue;
++                    }
++                    self.inner.connected.store(true, Ordering::Release);
++                    self.client = Some(Client {
++                        io: Box::new(stream),
++                        pending: None,
++                        queue: VecDeque::with_capacity(CONTROL_CAP),
++                        read: Vec::with_capacity(HEADER),
++                        eagain: 0,
++                    });
++                    self.enqueue(hello());
++                    self.snapshot();
++                    self.request_keyframe();
++                }
++                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
++                Err(_) => break,
++            }
++        }
++    }
++    fn close(&mut self) {
++        self.client = None;
++        self.inner.connected.store(false, Ordering::Release);
++    }
++    fn enqueue(&mut self, data: Vec<u8>) {
++        if let Some(c) = self.client.as_mut() {
++            if c.pending.is_none() {
++                c.pending = Some(Pending {
++                    data,
++                    at: 0,
++                    started: Instant::now(),
++                });
++            } else if c.queue.len() < CONTROL_CAP {
++                c.queue.push_back(data);
++            } else {
++                self.close();
++            }
++        }
++    }
++    fn drain(&mut self) {
++        for _ in 0..MAX_CONTROL_PER_SERVICE {
++            let event = { self.inner.control_rx.lock().unwrap().try_recv() };
++            match event {
++                Ok(e) => {
++                    self.inner.control_count.fetch_sub(1, Ordering::AcqRel);
++                    self.control_event(e);
++                }
++                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
++            }
++        }
++        self.prefer_audio = !self.prefer_audio;
++        for audio_first in queue_order(self.prefer_audio) {
++            if audio_first {
++                for _ in 0..MAX_AUDIO_PER_SERVICE {
++                    let event = { self.inner.audio_rx.lock().unwrap().try_recv().ok() };
++                    let Some(e) = event else { break };
++                    self.inner.audio_count.fetch_sub(1, Ordering::AcqRel);
++                    self.audio_event(e);
++                }
++            } else {
++                for _ in 0..MAX_VIDEO_PER_SERVICE {
++                    let event = { self.inner.video_rx.lock().unwrap().try_recv().ok() };
++                    let Some(e) = event else { break };
++                    self.inner.video_count.fetch_sub(1, Ordering::AcqRel);
++                    self.video_event(e);
++                }
++            }
++        }
++    }
++    fn control_event(&mut self, e: Control) {
++        match e {
++            Control::SessionBegin(id) => {
++                self.state = Snapshot {
++                    session: id,
++                    ..Default::default()
++                };
++                self.enqueue(record(SESSION_BEGIN, 0, id, 0, 0, 0, &[], [0; 4]));
++            }
++            Control::SessionEnd(id, reason) => {
++                if self.state.session == id {
++                    self.enqueue(record(SESSION_END, 0, id, 0, 0, 0, &[], [reason, 0, 0, 0]));
++                    self.state = Snapshot::default();
++                }
++            }
++            Control::VideoStart(s, st) => self.enqueue(record(VIDEO_START, 0, s, st, 0, 0, &[], [0; 4])),
++            Control::VideoConfig(s, st, id, cfg) => {
++                let bytes = cfg.avcc.sps_pps;
++                if !valid_config(&bytes) {
++                    self.enqueue(record(VIDEO_CONFIG, 0, s, st, 0, 0, &[], [0, cfg.width, cfg.height, id]));
++                } else {
++                    self.state.video = Some((st, id, bytes.clone(), cfg.width, cfg.height));
++                    self.enqueue(record(VIDEO_CONFIG, 0, s, st, 0, 0, &bytes, [1, cfg.width, cfg.height, id]));
++                }
++            }
++            Control::VideoEnd(s, st, r) => self.enqueue(record(VIDEO_END, 0, s, st, 0, 0, &[], [r, 0, 0, 0])),
++            Control::AudioStart(s, st, meta) => {
++                self.state.audio.retain(|(id, _)| *id != st);
++                if self.state.audio.len() == 2 {
++                    self.state.audio.remove(0);
++                }
++                self.state.audio.push((st, meta));
++                self.enqueue(audio_start(s, st, meta, 0));
++            }
++            Control::AudioEnd(s, st, r) => {
++                self.state.audio.retain(|(id, _)| *id != st);
++                self.enqueue(record(AUDIO_END, 0, s, st, 0, 0, &[], [r, 0, 0, 0]));
++            }
++        }
++    }
++    fn video_event(&mut self, e: Video) {
++        if self.state.session != e.session || self.state.video.as_ref().map(|v| v.0) != Some(e.stream) || e.config == 0 {
++            return;
++        }
++        let mut flags = if e.frame.is_known_keyframe() { KEYFRAME } else { 0 };
++        if e.discontinuity {
++            flags |= DISCONTINUITY;
++        }
++        let pts = pts_us(&e.frame);
++        self.enqueue(record(
++            VIDEO_FRAME,
++            flags,
++            e.session,
++            e.stream,
++            e.sequence,
++            pts,
++            &e.frame.data,
++            [1, e.frame.width, e.frame.height, e.config],
++        ));
++    }
++    fn audio_event(&mut self, e: Audio) {
++        if self.state.session != e.session || !valid_pcm(e.meta.pcm) {
++            return;
++        }
++        let frames = e.samples.len() / e.meta.pcm.channels_per_frame as usize;
++        let mut bytes = Vec::with_capacity(e.samples.len() * 2);
++        for v in e.samples {
++            bytes.extend_from_slice(&v.to_le_bytes());
++        }
++        let flags = if e.discontinuity { DISCONTINUITY } else { 0 };
++        self.enqueue(record(
++            AUDIO_CHUNK,
++            flags,
++            e.session,
++            e.stream,
++            e.sequence,
++            monotonic_us(),
++            &bytes,
++            [
++                audio_type(e.meta.audio_type),
++                e.meta.pcm.sample_rate,
++                e.meta.pcm.channels_per_frame,
++                frames as u32,
++            ],
++        ));
++    }
++    fn flush(&mut self) {
++        let Some(c) = self.client.as_mut() else {
++            return;
++        };
++        let Some(p) = c.pending.as_mut() else {
++            return;
++        };
++        let offer = (p.data.len() - p.at).min(MAX_WRITE_BYTES_PER_SERVICE);
++        match c.io.write(&p.data[p.at..p.at + offer]) {
++            Ok(0) => self.close(),
++            Ok(n) => {
++                p.at += n;
++                c.eagain = 0;
++                if p.at == p.data.len() {
++                    c.pending = c.queue.pop_front().map(|data| Pending {
++                        data,
++                        at: 0,
++                        started: Instant::now(),
++                    });
++                }
++            }
++            Err(e) if e.kind() == ErrorKind::WouldBlock => {
++                c.eagain += 1;
++                if c.eagain >= 2 || p.started.elapsed() >= WRITE_DEADLINE {
++                    self.close();
++                }
++            }
++            Err(_) => self.close(),
++        }
++    }
++    fn read_request(&mut self) {
++        let mut close = false;
++        let mut target = None;
++        {
++            let Some(c) = self.client.as_mut() else {
++                return;
++            };
++            let mut buf = [0; HEADER];
++            match c.io.read(&mut buf) {
++                Ok(0) => close = true,
++                Ok(n) => {
++                    c.read.extend_from_slice(&buf[..n]);
++                    if c.read.len() > HEADER {
++                        close = true;
++                    } else if c.read.len() == HEADER {
++                        target = request_target(&c.read);
++                        close = target.is_none();
++                        if !close {
++                            c.read.clear();
++                        }
++                    }
++                }
++                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
++                Err(_) => close = true,
++            }
++        }
++        if close {
++            self.close();
++            return;
++        }
++        if let Some((session, stream)) = target {
++            #[cfg(test)]
++            {
++                self.last_request = Some((session, stream));
++            }
++            if session == self.state.session && self.state.video.as_ref().map(|v| v.0) == Some(stream) {
++                self.request_keyframe();
++            }
++        }
++    }
++    fn request_keyframe(&self) {
++        let mut last = self.inner.last_keyframe.lock().unwrap();
++        if last.elapsed() >= KEYFRAME_INTERVAL {
++            if let Some(h) = self.inner.handle.lock().unwrap().as_ref() {
++                h.request_keyframe();
++                *last = Instant::now();
++            }
++        }
++    }
++    fn snapshot(&mut self) {
++        let s = self.state.session;
++        if s == 0 {
++            return;
++        }
++        self.enqueue(record(SESSION_BEGIN, 4, s, 0, 0, 0, &[], [0; 4]));
++        if let Some((st, id, bytes, w, h)) = self.state.video.clone() {
++            self.enqueue(record(VIDEO_START, 4, s, st, 0, 0, &[], [0; 4]));
++            self.enqueue(record(VIDEO_CONFIG, 4, s, st, 0, 0, &bytes, [1, w, h, id]));
++        }
++        for (st, m) in self.state.audio.clone() {
++            self.enqueue(audio_start(s, st, m, 4));
++        }
++    }
++}
++impl Drop for MediaServer {
++    fn drop(&mut self) {
++        self.close();
++        if let Ok(m) = fs::symlink_metadata(&self.path) {
++            if m.file_type().is_socket() && m.dev() == self.dev && m.ino() == self.ino {
++                let _ = fs::remove_file(&self.path);
++            }
++        }
++    }
++}
++
++fn prepare(path: &Path) -> io::Result<()> {
++    let parent = path
++        .parent()
++        .filter(|p| !p.as_os_str().is_empty())
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "media socket has no parent"))?;
++    let pm = fs::symlink_metadata(parent)?;
++    if pm.file_type().is_symlink() || !pm.is_dir() {
++        return Err(io::Error::new(
++            ErrorKind::PermissionDenied,
++            "media socket parent must be existing non-symlink directory",
++        ));
++    }
++    match fs::symlink_metadata(path) {
++        Ok(m) if m.file_type().is_socket() && m.uid() == unsafe { libc::geteuid() } => fs::remove_file(path),
++        Ok(m) if m.file_type().is_socket() => Err(io::Error::new(ErrorKind::PermissionDenied, "refusing foreign media socket")),
++        Ok(_) => Err(io::Error::new(ErrorKind::AlreadyExists, "refusing non-socket media path")),
++        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
++        Err(e) => Err(e),
++    }
++}
++fn accepts_peer_uid(uid: Option<u32>, expected: u32) -> bool {
++    uid == Some(expected)
++}
++fn queue_order(prefer_audio: bool) -> [bool; 2] {
++    [prefer_audio, !prefer_audio]
++}
++fn request_target(h: &[u8]) -> Option<(u64, u32)> {
++    if h.len() != HEADER
++        || &h[..4] != b"CPMF"
++        || h[4] != 1
++        || h[5] != 0
++        || u16be(&h[6..8]) != HEADER as u16
++        || u16be(&h[8..10]) != REQUEST_KEYFRAME
++        || h[10..12].iter().any(|b| *b != 0)
++        || h[24..].iter().any(|b| *b != 0)
++    {
++        return None;
++    }
++    Some((u64be(&h[16..24]), u32be(&h[12..16])))
++}
++fn peer_uid(s: &UnixStream) -> io::Result<u32> {
++    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
++    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
++    let r = unsafe {
++        libc::getsockopt(
++            s.as_raw_fd(),
++            libc::SOL_SOCKET,
++            libc::SO_PEERCRED,
++            (&mut cred as *mut libc::ucred).cast(),
++            &mut len,
++        )
++    };
++    if r == 0 {
++        Ok(cred.uid)
++    } else {
++        Err(io::Error::last_os_error())
++    }
++}
++fn record(kind: u16, flags: u16, session: u64, stream: u32, seq: u64, pts: u64, payload: &[u8], p: [u32; 4]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(HEADER + payload.len());
++    out.extend_from_slice(b"CPMF");
++    out.push(1);
++    out.push(0);
++    out.extend_from_slice(&(HEADER as u16).to_be_bytes());
++    out.extend_from_slice(&kind.to_be_bytes());
++    out.extend_from_slice(&flags.to_be_bytes());
++    out.extend_from_slice(&stream.to_be_bytes());
++    out.extend_from_slice(&session.to_be_bytes());
++    out.extend_from_slice(&seq.to_be_bytes());
++    out.extend_from_slice(&pts.to_be_bytes());
++    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
++    for x in p {
++        out.extend_from_slice(&x.to_be_bytes());
++    }
++    out.extend_from_slice(&0u32.to_be_bytes());
++    out.extend_from_slice(payload);
++    out
++}
++fn hello() -> Vec<u8> {
++    record(SERVER_HELLO, 0, 0, 0, 0, 0, &[], [MAX_PAYLOAD as u32, 1000, 7, 1])
++}
++fn audio_start(s: u64, st: u32, m: AudioMeta, flags: u16) -> Vec<u8> {
++    let mut d = Vec::with_capacity(16);
++    d.push(m.stream_type as u8);
++    d.push(1);
++    d.push(m.duplex as u8);
++    d.push(0);
++    d.extend_from_slice(&m.latency_us.to_be_bytes());
++    d.extend_from_slice(&m.audio_format.bits().to_be_bytes());
++    record(
++        AUDIO_START,
++        flags,
++        s,
++        st,
++        0,
++        0,
++        &d,
++        [audio_type(m.audio_type), m.pcm.sample_rate, m.pcm.channels_per_frame, 1],
++    )
++}
++fn audio_type(v: AudioType) -> u32 {
++    match v {
++        AudioType::Default => 0,
++        AudioType::Alert => 1,
++        AudioType::Media => 2,
++        AudioType::Telephony => 3,
++        AudioType::SpeechRecognition => 4,
++        AudioType::Compatibility => 5,
++    }
++}
++fn valid_pcm(p: AudioStreamBasicDescription) -> bool {
++    matches!(p.sample_rate, 8000 | 16000 | 24000 | 32000 | 44100 | 48000)
++        && matches!(p.channels_per_frame, 1 | 2)
++        && p.format == AudioCodec::LinearPcm
++        && p.format_flags.contains(catplay_carplay::audio::AudioFormatFlags::IS_SIGNED_INT)
++        && !p
++            .format_flags
++            .contains(catplay_carplay::audio::AudioFormatFlags::IS_FLOAT | catplay_carplay::audio::AudioFormatFlags::IS_NON_INTERLEAVED)
++        && p.bits_per_channel == 16
++        && p.bytes_per_frame == p.channels_per_frame * 2
++}
++fn valid_config(b: &[u8]) -> bool {
++    if b.is_empty() || b.len() > MAX_CONFIG {
++        return false;
++    }
++    let mut sps = false;
++    let mut pps = false;
++    let mut i = 0;
++    while i + 4 <= b.len() {
++        let n = if b[i..].starts_with(&[0, 0, 0, 1]) {
++            4
++        } else if b[i..].starts_with(&[0, 0, 1]) {
++            3
++        } else {
++            i += 1;
++            continue;
++        };
++        if i + n >= b.len() {
++            return false;
++        }
++        match b[i + n] & 31 {
++            7 => sps = true,
++            8 => pps = true,
++            _ => {}
++        }
++        i += n;
++    }
++    sps && pps
++}
++fn pts_us(f: &EncodedVideoFrame) -> u64 {
++    let base = monotonic_us();
++    match f.pts.decode() {
++        catplay_carplay::video::PtsDecoded::Past(d) => base.saturating_sub(d.as_micros() as u64),
++        catplay_carplay::video::PtsDecoded::Future(d) => base.saturating_add(d.as_micros() as u64),
++    }
++    .max(1)
++}
++fn monotonic_us() -> u64 {
++    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
++    START.get_or_init(Instant::now).elapsed().as_micros().max(1) as u64
++}
++fn u16be(b: &[u8]) -> u16 {
++    u16::from_be_bytes([b[0], b[1]])
++}
++fn u32be(b: &[u8]) -> u32 {
++    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
++}
++fn u64be(b: &[u8]) -> u64 {
++    u64::from_be_bytes(b.try_into().unwrap())
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        os::unix::net::UnixStream,
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++
++    static TEST_ID: AtomicUsize = AtomicUsize::new(0);
++
++    struct TempSocketDir(PathBuf);
++    impl TempSocketDir {
++        fn new() -> Self {
++            let path = std::env::temp_dir().join(format!(
++                "catplay-media-{}-{}",
++                std::process::id(),
++                TEST_ID.fetch_add(1, Ordering::Relaxed)
++            ));
++            fs::create_dir(&path).unwrap();
++            Self(path)
++        }
++        fn socket(&self) -> PathBuf {
++            self.0.join("media.sock")
++        }
++    }
++    impl Drop for TempSocketDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn test_inner() -> Arc<Inner> {
++        let (control, control_rx) = mpsc::sync_channel(CONTROL_CAP);
++        let (video, video_rx) = mpsc::sync_channel(VIDEO_CAP);
++        let (audio, audio_rx) = mpsc::sync_channel(AUDIO_CAP);
++        Arc::new(Inner {
++            control,
++            control_rx: Mutex::new(control_rx),
++            control_count: AtomicUsize::new(0),
++            video,
++            video_rx: Mutex::new(video_rx),
++            video_count: AtomicUsize::new(0),
++            audio,
++            audio_rx: Mutex::new(audio_rx),
++            audio_count: AtomicUsize::new(0),
++            connected: AtomicBool::new(false),
++            fatal: AtomicBool::new(false),
++            session: AtomicU64::new(0),
++            next_stream: AtomicU32::new(1),
++            handle: Mutex::new(None),
++            last_keyframe: Mutex::new(Instant::now() - KEYFRAME_INTERVAL),
++        })
++    }
++    fn test_server(dir: &TempSocketDir) -> MediaServer {
++        let path = dir.socket();
++        prepare(&path).unwrap();
++        let listener = UnixListener::bind(&path).unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let m = fs::symlink_metadata(&path).unwrap();
++        MediaServer {
++            listener,
++            path,
++            dev: m.dev(),
++            ino: m.ino(),
++            inner: test_inner(),
++            client: None,
++            state: Snapshot::default(),
++            last_heartbeat: Instant::now(),
++            prefer_audio: false,
++            last_request: None,
++        }
++    }
++    fn install_io(server: &mut MediaServer, io: Box<dyn ClientIo>, data: Vec<u8>) {
++        server.client = Some(Client {
++            io,
++            pending: Some(Pending {
++                data,
++                at: 0,
++                started: Instant::now(),
++            }),
++            queue: VecDeque::new(),
++            read: Vec::new(),
++            eagain: 0,
++        });
++    }
++
++    struct ShortWriter {
++        writes: Arc<Mutex<Vec<usize>>>,
++        amount: usize,
++        blocks: u8,
++    }
++    impl Read for ShortWriter {
++        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
++            Err(io::Error::from(ErrorKind::WouldBlock))
++        }
++    }
++    impl Write for ShortWriter {
++        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
++            self.writes.lock().unwrap().push(data.len());
++            if self.blocks > 0 {
++                self.blocks -= 1;
++                return Err(io::Error::from(ErrorKind::WouldBlock));
++            }
++            Ok(data.len().min(self.amount))
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn flush_caps_offer_and_preserves_pending_offset_after_short_writes() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        install_io(
++            &mut server,
++            Box::new(ShortWriter {
++                writes: writes.clone(),
++                amount: 17,
++                blocks: 0,
++            }),
++            vec![7; MAX_WRITE_BYTES_PER_SERVICE + 99],
++        );
++        server.flush();
++        assert_eq!(server.client.as_ref().unwrap().pending.as_ref().unwrap().at, 17);
++        server.flush();
++        assert_eq!(server.client.as_ref().unwrap().pending.as_ref().unwrap().at, 34);
++        assert_eq!(
++            &*writes.lock().unwrap(),
++            &[MAX_WRITE_BYTES_PER_SERVICE, MAX_WRITE_BYTES_PER_SERVICE]
++        );
++    }
++
++    #[test]
++    fn real_unix_accepts_current_uid() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let _client = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        assert!(server.client.is_some());
++        assert!(accepts_peer_uid(Some(unsafe { libc::geteuid() }), unsafe { libc::geteuid() }));
++    }
++
++    #[test]
++    fn accept_metadata_helper_rejects_mismatched_uid() {
++        let uid = unsafe { libc::geteuid() };
++        assert!(!accepts_peer_uid(Some(uid.wrapping_add(1)), uid));
++    }
++
++    #[test]
++    fn stale_socket_is_replaced() {
++        let dir = TempSocketDir::new();
++        let path = dir.socket();
++        drop(UnixListener::bind(&path).unwrap());
++        let _server = test_server(&dir);
++        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
++    }
++
++    #[test]
++    fn drop_keeps_a_replacement_socket_inode() {
++        let dir = TempSocketDir::new();
++        let path = dir.socket();
++        let server = test_server(&dir);
++        fs::remove_file(&path).unwrap();
++        let replacement = UnixListener::bind(&path).unwrap();
++        drop(server);
++        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
++        drop(replacement);
++    }
++
++    #[test]
++    fn second_real_client_is_rejected_without_disturbing_first() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let mut first = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        let mut second = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        first.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
++        let mut hello = [0; 4];
++        first.read_exact(&mut hello).unwrap();
++        assert_eq!(&hello, b"CPMF");
++        second.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
++        let mut one = [0];
++        assert_eq!(second.read(&mut one).unwrap(), 0);
++        assert!(server.client.is_some());
++    }
++
++    #[test]
++    fn two_wouldblocks_evict_writer_via_production_flush() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        install_io(
++            &mut server,
++            Box::new(ShortWriter {
++                writes,
++                amount: 1,
++                blocks: 2,
++            }),
++            vec![1],
++        );
++        server.flush();
++        assert!(server.client.is_some());
++        server.flush();
++        assert!(server.client.is_none());
++    }
++
++    #[test]
++    fn write_deadline_evicts_writer_via_production_flush() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        install_io(
++            &mut server,
++            Box::new(ShortWriter {
++                writes,
++                amount: 1,
++                blocks: 1,
++            }),
++            vec![1],
++        );
++        server.client.as_mut().unwrap().pending.as_mut().unwrap().started = Instant::now() - WRITE_DEADLINE;
++        server.flush();
++        assert!(server.client.is_none());
++    }
++
++    fn request(session: u64, stream: u32) -> Vec<u8> {
++        record(REQUEST_KEYFRAME, 0, session, stream, 0, 0, &[], [0; 4])
++    }
++    #[test]
++    fn real_client_reverse_keyframe_request_parses_exact_session_and_stream() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        server.state.session = 91;
++        server.state.video = Some((17, 1, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 1, 1));
++        let mut client = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        client.write_all(&request(91, 17)).unwrap();
++        server.read_request();
++        assert!(server.client.is_some());
++        assert_eq!(server.last_request, Some((91, 17)));
++    }
++
++    #[test]
++    fn malformed_reverse_request_from_real_client_is_closed() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let mut client = UnixStream::connect(dir.socket()).unwrap();
++        server.service_once();
++        let mut malformed = request(91, 17);
++        malformed[4] = 2;
++        client.write_all(&malformed).unwrap();
++        server.read_request();
++        assert!(server.client.is_none());
++    }
++
++    fn meta() -> AudioMeta {
++        let pcm = AudioStreamBasicDescription::fill_pcm(48_000, 16, 16, 2, false);
++        AudioMeta {
++            stream_type: StreamType::MainAudio,
++            audio_type: AudioType::Media,
++            audio_format: AudioFormat::PCM_48000_STEREO,
++            pcm,
++            latency_us: 0,
++            duplex: false,
++        }
++    }
++    fn read_record(client: &mut UnixStream) -> Vec<u8> {
++        let mut h = vec![0; HEADER];
++        client.read_exact(&mut h).unwrap();
++        let n = u32be(&h[40..44]) as usize;
++        let mut body = vec![0; n];
++        client.read_exact(&mut body).unwrap();
++        h.extend(body);
++        h
++    }
++    #[test]
++    fn reconnects_receive_bounded_hello_and_current_snapshot_in_order() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let m = meta();
++        server.state = Snapshot {
++            session: 7,
++            video: Some((3, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)),
++            audio: vec![(4, m), (5, m)],
++        };
++        for _ in 0..2 {
++            let mut client = UnixStream::connect(dir.socket()).unwrap();
++            client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
++            for _ in 0..6 {
++                server.service_once();
++            }
++            let kinds: Vec<_> = (0..6)
++                .map(|_| {
++                    let r = read_record(&mut client);
++                    assert!(r.len() <= HEADER + MAX_CONFIG);
++                    u16be(&r[8..10])
++                })
++                .collect();
++            assert_eq!(
++                kinds,
++                vec![SERVER_HELLO, SESSION_BEGIN, VIDEO_START, VIDEO_CONFIG, AUDIO_START, AUDIO_START]
++            );
++            drop(client);
++            server.service_once();
++        }
++    }
++
++    fn video(sequence: u64) -> Video {
++        Video {
++            session: 7,
++            stream: 3,
++            sequence,
++            config: 4,
++            frame: EncodedVideoFrame {
++                pts: Instant::now().into(),
++                width: 640,
++                height: 480,
++                data: bytes::BytesMut::from(&b"   e"[..]),
++                config: None,
++                nal_offsets: None,
++                is_keyframe: Some(true),
++                header_buf: bytes::BytesMut::new(),
++                chacha_tag_buf: bytes::BytesMut::new(),
++            },
++            discontinuity: false,
++        }
++    }
++    #[test]
++    fn preloaded_refilled_video_and_audio_keep_audio_within_bounded_output_records() {
++        let dir = TempSocketDir::new();
++        let mut server = test_server(&dir);
++        let mut client = UnixStream::connect(dir.socket()).unwrap();
++        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
++        server.service_once();
++        let _ = read_record(&mut client);
++        let m = meta();
++        server.state = Snapshot {
++            session: 7,
++            video: Some((3, 4, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68], 640, 480)),
++            audio: vec![(4, m)],
++        };
++        let mut kinds = Vec::new();
++        for sequence in 1..=8 {
++            assert!(server.inner.video.try_send(video(sequence)).is_ok());
++            server.inner.video_count.fetch_add(1, Ordering::AcqRel);
++            assert!(server
++                .inner
++                .audio
++                .try_send(Audio {
++                    session: 7,
++                    stream: 4,
++                    sequence,
++                    meta: m,
++                    samples: vec![1; 32],
++                    discontinuity: false
++                })
++                .is_ok());
++            server.inner.audio_count.fetch_add(1, Ordering::AcqRel);
++            server.service_once();
++            server.service_once();
++            for _ in 0..2 {
++                let r = read_record(&mut client);
++                assert!(r.len() <= HEADER + MAX_PAYLOAD);
++                assert!(u32be(&r[40..44]) as usize <= MAX_PAYLOAD);
++                kinds.push(u16be(&r[8..10]));
++            }
++        }
++        for window in kinds.windows(3) {
++            assert!(window.contains(&AUDIO_CHUNK));
++        }
++        assert_eq!(kinds.iter().filter(|&&kind| kind == AUDIO_CHUNK).count(), 8);
++        assert_eq!(kinds.iter().filter(|&&kind| kind == VIDEO_FRAME).count(), 8);
++        assert!(server.inner.video_count.load(Ordering::Acquire) <= VIDEO_CAP);
++        assert!(server.inner.audio_count.load(Ordering::Acquire) <= AUDIO_CAP);
++    }
++    #[test]
++    fn hello_framing_is_a_complete_cpmf_record() {
++        let hello = hello();
++        assert_eq!(hello.len(), HEADER);
++        assert_eq!(&hello[..4], b"CPMF");
++        assert_eq!(u16be(&hello[8..10]), SERVER_HELLO);
++    }
++
++    #[test]
++    fn heartbeat_keeps_zero_sequence_and_monotonic_timestamp() {
++        let a = record(HEARTBEAT_RECORD, 0, 7, 0, 0, monotonic_us(), &[], [0; 4]);
++        let b = record(HEARTBEAT_RECORD, 0, 7, 0, 0, monotonic_us(), &[], [0; 4]);
++        assert_eq!(u64be(&a[24..32]), 0);
++        assert!(u64be(&b[32..40]) >= u64be(&a[32..40]));
++    }
++
++    #[test]
++    fn malformed_annex_b_config_and_pcm_are_not_admitted() {
++        assert!(!valid_config(&[0, 0, 0, 1, 0x67]));
++        let mut pcm = AudioStreamBasicDescription::fill_pcm(48_000, 16, 16, 2, false);
++        assert!(valid_pcm(pcm));
++        pcm.bits_per_channel = 24;
++        assert!(!valid_pcm(pcm));
++    }
++}
+
+diff --git a/c2a/catplay_c2a/src/prod_gadget.rs b/c2a/catplay_c2a/src/prod_gadget.rs
+index ec90c6c..6a6d1f2 100644
+--- a/c2a/catplay_c2a/src/prod_gadget.rs
++++ b/c2a/catplay_c2a/src/prod_gadget.rs
+@@ -17,7 +17,7 @@ use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper, EventToken, Rec
+ use log::{debug, error, info};
+ use tokio::sync::Mutex as TokioMutex;
+ 
+-use crate::proxy_rpc::{CarManager, CarPlayRxSession, TxAdapter, TxAdapterOp};
++use crate::{MediaTap, TelemetryLifecycle, TelemetrySnapshot, proxy_rpc::{CarManager, CarPlayRxSession, TxAdapter, TxAdapterOp}};
+ 
+ pub struct ProdGadgetConfig {
+     pub homekit_rx: HomekitStorageRef,
+@@ -39,6 +39,7 @@ pub struct ProdGadgetConfig {
+ 
+     pub bt_cache_file: String,
+     pub persist_dir: Option<PathBuf>,
++    pub media: MediaTap,
+ }
+ 
+ pub struct ProdGadget {
+@@ -50,6 +51,7 @@ pub struct ProdGadget {
+     pending_transmitter: Arc<TokioMutex<Option<TeardownGuard<AirPlayTransmitterImpl>>>>,
+ 
+     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
++    lifecycle: LocalStatus,
+     burst_wakeups: bool,
+ }
+ 
+@@ -109,11 +111,23 @@ impl ProdGadget {
+                 tx: None,
+                 pending_transmitter: Default::default(),
+                 last_tx: Default::default(),
++                lifecycle: Ok(ProdGadgetState::Initial),
+                 burst_wakeups: false,
+             },
+             Ok(ProdGadgetState::Initial),
+         )
+     }
++
++    pub fn telemetry_snapshot(&mut self) -> TelemetrySnapshot {
++        let lifecycle = self
++            .lifecycle
++            .as_ref()
++            .map(TelemetryLifecycle::from)
++            .unwrap_or(TelemetryLifecycle::Error);
++        let tx = self.tx.as_mut().and_then(|tx| tx.state().as_ref().ok()).cloned();
++        let rx = self.rx.as_mut().and_then(|rx| rx.state().as_ref().ok()).cloned();
++        TelemetrySnapshot::from_gadget_states(lifecycle, tx.as_ref(), rx.as_ref())
++    }
+ }
+ 
+ impl AsyncShutdown for ProdGadget {
+@@ -154,6 +168,7 @@ impl Reconcilable for ProdGadget {
+     type Output = LocalStatus;
+ 
+     async fn on_update(&mut self, new: LocalStatus) -> LocalStatus {
++        self.lifecycle = new.clone();
+         match new {
+             Ok(ref ok) => info!("Progressing -> {ok:?}"),
+             Err(ref err) => error!("Entered error state: {err:?}"),
+@@ -211,13 +226,14 @@ impl Reconcilable for ProdGadget {
+                 Some(&self.cfg.bt_cache_file),
+                 {
+                     let car = self.last_tx.clone();
++                    let media = self.cfg.media.clone();
+ 
+                     move || {
+                         let Some(car) = car.lock().unwrap().clone() else {
+                             return CarPlayRxSession::reject();
+                         };
+ 
+-                        let sess = TxAdapter::new(car.proxy_tx.clone());
++                        let sess = TxAdapter::new(car.proxy_tx.clone(), media.clone());
+                         CarPlayRxSession::new(sess)
+                     }
+                 },
+diff --git a/c2a/catplay_c2a/src/proxy/pcm_proxy.rs b/c2a/catplay_c2a/src/proxy/pcm_proxy.rs
+index e699025..6c69da5 100644
+--- a/c2a/catplay_c2a/src/proxy/pcm_proxy.rs
++++ b/c2a/catplay_c2a/src/proxy/pcm_proxy.rs
+@@ -10,6 +10,8 @@ use catplay_carplay::{
+     rtsp_frame::RtspResult,
+ };
+ use log::debug;
++
++use crate::media_ipc::AudioTap;
+ use tokio::{task::JoinHandle, time::sleep};
+ 
+ #[inline]
+@@ -35,6 +37,7 @@ pub struct PcmProxyPlayer {
+     interval: Duration,
+     receiver: Option<mpsc::Receiver<AudioSinkBox<i16>>>,
+     limit: usize,
++    tap: Option<AudioTap>,
+ }
+ 
+ impl PcmProxyPlayer {
+@@ -45,6 +48,7 @@ impl PcmProxyPlayer {
+         channels_per_frame: usize,
+         receiver: mpsc::Receiver<AudioSinkBox<i16>>,
+         limit: usize,
++        tap: Option<AudioTap>,
+     ) -> Self {
+         Self {
+             ring: Some(ring),
+@@ -57,6 +61,7 @@ impl PcmProxyPlayer {
+             interval,
+             receiver: Some(receiver),
+             limit,
++            tap,
+         }
+     }
+ 
+@@ -72,10 +77,19 @@ impl PcmProxyPlayer {
+             duration_to_frames_u32_saturating(INTERVAL, sample_rate as _) as usize * channels_per_frame * RING_INTERVAL_MULTIPLIER;
+ 
+         let ring = RingBuffer::spsc(ring_size_samples);
+-        let player = PcmProxyPlayer::new(ring, sample_rate, INTERVAL, channels_per_frame, channel.1, ring_size_samples);
++        let player = PcmProxyPlayer::new(ring, sample_rate, INTERVAL, channels_per_frame, channel.1, ring_size_samples, None);
+         let recorder = PcmProxyRecorder::new(channel.0);
+         (player, recorder)
+     }
++
++    pub fn pair_with_tap(sample_rate: u32, channels_per_frame: usize, tap: AudioTap) -> (PcmProxyPlayer, PcmProxyRecorder) {
++        const INTERVAL: Duration = Duration::from_millis(10);
++        const RING_INTERVAL_MULTIPLIER: usize = 50;
++        let channel = mpsc::channel();
++        let size = duration_to_frames_u32_saturating(INTERVAL, sample_rate as _) as usize * channels_per_frame * RING_INTERVAL_MULTIPLIER;
++        let ring = RingBuffer::spsc(size);
++        (PcmProxyPlayer::new(ring, sample_rate, INTERVAL, channels_per_frame, channel.1, size, Some(tap)), PcmProxyRecorder::new(channel.0))
++    }
+ }
+ 
+ impl AudioPlayer for PcmProxyPlayer {
+@@ -102,6 +116,7 @@ impl AudioPlayer for PcmProxyPlayer {
+         let mut recorder = None;
+         let _limit = self.limit;
+         let mut start = Instant::now();
++        let tap = self.tap.take();
+ 
+         // We have a lot of buffered audio, but don't stream too much ahead or receiver will start dropping data
+         // (hard limit is ~20*latency_ms, depends on version of CarPlay SDK)
+@@ -153,6 +168,8 @@ impl AudioPlayer for PcmProxyPlayer {
+                         readable
+                     );
+ 
++                    // Copying into the bounded tap is best-effort; the car write remains unconditional.
++                    if let Some(tap) = tap.as_ref() { tap.samples(&buf); }
+                     v.write(&buf);
+                 }
+ 
+diff --git a/c2a/catplay_c2a/src/proxy_rpc/car_manager.rs b/c2a/catplay_c2a/src/proxy_rpc/car_manager.rs
+index 4adfd72..588f7fd 100644
+--- a/c2a/catplay_c2a/src/proxy_rpc/car_manager.rs
++++ b/c2a/catplay_c2a/src/proxy_rpc/car_manager.rs
+@@ -344,10 +344,11 @@ impl CarManager {
+                 audio_format,
+                 pcm_format,
+                 duplex,
++                media,
+                 response,
+             } => {
+                 let tx = self.car_state.clone();
+-                let fut = AudioProxyUtil::open_audio(tx, latency, stream_type, audio_type, audio_format, pcm_format, duplex);
++                let fut = AudioProxyUtil::open_audio(tx, latency, stream_type, audio_type, audio_format, pcm_format, duplex, media);
+                 self.tx_queue.push_back(
+                     async move {
+                         // Audio setup may fail, but don't treat it as full sanity error - let iPhone decide what it wants to do next
+diff --git a/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs b/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs
+index b3ddee0..6a7a513 100644
+--- a/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs
++++ b/c2a/catplay_c2a/src/proxy_rpc/proxy_screen.rs
+@@ -11,84 +11,35 @@ use log::warn;
+ use std::time::Duration;
+ use tokio::time::timeout;
+ 
++use crate::media_ipc::{MediaTap, VideoTap};
++
+ pub enum ScreenProxyOp {
+-    IphoneConfig {
+-        config: AvccConfigExtended,
+-    },
+-    IphoneFrame {
+-        frame: EncodedVideoFrame,
+-        handle: AirPlayReceiverHandleRef,
+-        consumed: oneshot::Sender<()>,
+-    },
+-    IphoneStreamStart {
+-        handle: AirPlayReceiverHandleRef,
+-    },
++    IphoneConfig { config: AvccConfigExtended },
++    IphoneFrame { frame: EncodedVideoFrame, handle: AirPlayReceiverHandleRef, consumed: oneshot::Sender<()> },
++    IphoneStreamStart { handle: AirPlayReceiverHandleRef },
+     IphoneStreamFinish,
+ }
+ 
+-pub struct ScreenProxy {
+-    channel: mpsc::UnboundedSender<ScreenProxyOp>,
+-    handle: AirPlayReceiverHandleRef,
+-}
+-
++pub struct ScreenProxy { channel: mpsc::UnboundedSender<ScreenProxyOp>, handle: AirPlayReceiverHandleRef, media: Option<VideoTap> }
+ impl ScreenProxy {
+     const FRAME_CONSUMED_TIMEOUT: Duration = Duration::from_millis(500);
+-
+-    pub fn new(handle: AirPlayReceiverHandleRef) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) {
+-        let channel = mpsc::unbounded();
+-        (Self::with_channel(handle, channel.0), channel.1)
+-    }
+-
+-    pub fn with_channel(handle: AirPlayReceiverHandleRef, tx: mpsc::UnboundedSender<ScreenProxyOp>) -> Self {
+-        let _ = tx.unbounded_send(ScreenProxyOp::IphoneStreamStart { handle: handle.clone() });
+-        Self { channel: tx, handle }
+-    }
+-}
+-
+-impl Drop for ScreenProxy {
+-    fn drop(&mut self) {
+-        let _ = self.channel.unbounded_send(ScreenProxyOp::IphoneStreamFinish);
+-    }
++    pub fn new(handle: AirPlayReceiverHandleRef) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) { let channel=mpsc::unbounded(); (Self::with_channel(handle,channel.0),channel.1) }
++    pub fn new_with_media(handle: AirPlayReceiverHandleRef, media: MediaTap) -> (Self, mpsc::UnboundedReceiver<ScreenProxyOp>) { let channel=mpsc::unbounded(); (Self::with_channel_media(handle,channel.0,Some(media.video_stream())),channel.1) }
++    pub fn with_channel(handle: AirPlayReceiverHandleRef, tx: mpsc::UnboundedSender<ScreenProxyOp>) -> Self { Self::with_channel_media(handle,tx,None) }
++    fn with_channel_media(handle: AirPlayReceiverHandleRef, tx: mpsc::UnboundedSender<ScreenProxyOp>, media: Option<VideoTap>) -> Self { let _=tx.unbounded_send(ScreenProxyOp::IphoneStreamStart { handle:handle.clone() }); Self { channel:tx,handle,media } }
+ }
+-
++impl Drop for ScreenProxy { fn drop(&mut self) { let _=self.channel.unbounded_send(ScreenProxyOp::IphoneStreamFinish); } }
+ #[async_trait]
+ impl ScreenReceiverSink for ScreenProxy {
+-    async fn init(&mut self) -> RtspResult<()> {
+-        Ok(())
+-    }
+-
+-    async fn set_avcc_config(&mut self, config: AvccConfigExtended) -> RtspResult<()> {
+-        let _ = self.channel.unbounded_send(ScreenProxyOp::IphoneConfig { config });
+-        Ok(())
+-    }
+-
+-    async fn process_frame(&mut self, frame: EncodedVideoFrame) -> RtspResult<()> {
+-        let os = oneshot::channel();
+-        if self
+-            .channel
+-            .unbounded_send(ScreenProxyOp::IphoneFrame {
+-                frame,
+-                handle: self.handle.clone(),
+-                consumed: os.0,
+-            })
+-            .is_ok()
+-        {
+-            match timeout(Self::FRAME_CONSUMED_TIMEOUT, os.1).await {
+-                Ok(Ok(())) => {}
+-                Ok(Err(_)) => {
+-                    warn!("ScreenProxy frame consumer dropped without ack");
+-                    return Err(RtspError::Closed);
+-                }
+-                Err(_) => {
+-                    // Prevents worst-case deadlocking if we start shutting down things in unlucky order
+-                    warn!("ScreenProxy frame consumer timeout after {:?}", Self::FRAME_CONSUMED_TIMEOUT);
+-                    return Err(RtspError::Timeout);
+-                }
+-            }
+-        }
+-
++    async fn init(&mut self)->RtspResult<()> {Ok(())}
++    async fn set_avcc_config(&mut self,config:AvccConfigExtended)->RtspResult<()> { if let Some(media)=self.media.as_ref(){media.config(config.clone());} let _=self.channel.unbounded_send(ScreenProxyOp::IphoneConfig{config});Ok(()) }
++    async fn process_frame(&mut self,frame:EncodedVideoFrame)->RtspResult<()> {
++        // The tap only performs an atomic-capacity check and try_send. It never owns
++        // the bridge frame or acknowledgement path below.
++        if let Some(media)=self.media.as_ref(){media.frame(&frame);}
++        let os=oneshot::channel();
++        if self.channel.unbounded_send(ScreenProxyOp::IphoneFrame { frame,handle:self.handle.clone(),consumed:os.0 }).is_ok() { match timeout(Self::FRAME_CONSUMED_TIMEOUT,os.1).await { Ok(Ok(()))=>{},Ok(Err(_))=>{warn!("ScreenProxy frame consumer dropped without ack");return Err(RtspError::Closed);},Err(_)=>{warn!("ScreenProxy frame consumer timeout after {:?}",Self::FRAME_CONSUMED_TIMEOUT);return Err(RtspError::Timeout);} } }
+         Ok(())
+     }
+ }
+-
+ impl AsyncShutdown for ScreenProxy {}
+diff --git a/c2a/catplay_c2a/src/proxy_rpc/tx_adapter.rs b/c2a/catplay_c2a/src/proxy_rpc/tx_adapter.rs
+index 458f37e..380fb4f 100644
+--- a/c2a/catplay_c2a/src/proxy_rpc/tx_adapter.rs
++++ b/c2a/catplay_c2a/src/proxy_rpc/tx_adapter.rs
+@@ -11,12 +11,13 @@ use catplay_carplay::{
+ use catplay_util::{mpsc, oneshot};
+ use log::{debug, info, warn};
+ 
+-use crate::proxy_rpc::{ScreenProxyOp, proxy_screen::ScreenProxy};
++use crate::{MediaTap, proxy_rpc::{ScreenProxyOp, proxy_screen::ScreenProxy}};
+ 
+ pub struct TxAdapter {
+     car: mpsc::UnboundedSender<TxAdapterOp>,
+     pending_mic: Option<AudioRecorderBox<i16>>,
+     handle: Option<AirPlayReceiverHandleRef>,
++    media: MediaTap,
+ }
+ 
+ pub enum TxAdapterOp {
+@@ -46,19 +47,14 @@ pub enum TxAdapterOp {
+         audio_format: AudioFormat,
+         pcm_format: AudioStreamBasicDescription,
+         duplex: bool,
++        media: MediaTap,
+ 
+         response: oneshot::Sender<RtspResult<(AudioPlayerBox<i16>, Option<AudioRecorderBox<i16>>)>>,
+     },
+ }
+ 
+ impl TxAdapter {
+-    pub fn new(car: mpsc::UnboundedSender<TxAdapterOp>) -> Self {
+-        Self {
+-            car,
+-            pending_mic: None,
+-            handle: None,
+-        }
+-    }
++    pub fn new(car: mpsc::UnboundedSender<TxAdapterOp>, media: MediaTap) -> Self { Self { car, pending_mic: None, handle: None, media } }
+ 
+     pub async fn proxy_cmd_and_spy(&mut self, command: &Command) -> RtspResult<RtspResponse> {
+         // Received over Wi-Fi; blocks RTSP thread
+@@ -88,6 +84,7 @@ impl TxAdapter {
+             audio_format,
+             pcm_format,
+             duplex,
++            media: self.media.clone(),
+             response: os.0,
+         });
+ 
+@@ -133,7 +130,7 @@ impl TxAdapter {
+     }
+ 
+     pub async fn proxy_screen(&mut self, _latency: Duration) -> RtspResult<ScreenReceiverSinkBox> {
+-        let screen = ScreenProxy::new(self.handle.clone().expect("handle missing"));
++        let screen = ScreenProxy::new_with_media(self.handle.clone().expect("handle missing"), self.media.clone());
+         let channel = screen.1;
+         let _ = self.car.unbounded_send(TxAdapterOp::ScreenChannel { channel });
+         Ok(Box::new(screen.0))
+@@ -143,12 +140,14 @@ impl TxAdapter {
+         // TODO move to initial setup
+ 
+         let _ = self.car.unbounded_send(TxAdapterOp::IphoneConnected { handle: handle.clone() });
++        self.media.begin_session(handle.clone());
+         self.handle.replace(handle);
+     }
+ 
+     pub async fn on_shutdown(&mut self) {}
+ 
+     pub fn on_drop(&mut self) {
++        self.media.end_session(1);
+         let _ = self.car.unbounded_send(TxAdapterOp::IphoneDisconnected {});
+     }
+ 
+diff --git a/c2a/catplay_c2a/src/telemetry.rs b/c2a/catplay_c2a/src/telemetry.rs
+new file mode 100644
+index 0000000..ec9d927
+--- /dev/null
++++ b/c2a/catplay_c2a/src/telemetry.rs
+@@ -0,0 +1,492 @@
++use std::{
++    fs,
++    io::{self, ErrorKind},
++    os::unix::{
++        fs::{FileTypeExt, MetadataExt, PermissionsExt},
++        net::UnixListener as StdUnixListener,
++    },
++    path::{Path, PathBuf},
++    time::{Duration, Instant},
++};
++
++use catplay_carplay_rx_gadget::CarPlayWirelessGadgetState;
++use catplay_carplay_tx_gadget::client::CarPlayUsbClientGadgetStatus;
++use serde::Serialize;
++use tokio::net::UnixStream;
++
++use crate::ProdGadgetState;
++
++const DEFAULT_SOCKET: &str = "/run/zero2w/catplay.sock";
++const MAX_CLIENTS: usize = 4;
++const MAX_ACCEPT_ATTEMPTS_PER_SERVICE: usize = 8;
++const MAX_LINE: usize = 4096;
++const HEARTBEAT: Duration = Duration::from_secs(1);
++const MAX_WOULD_BLOCK_RETRIES: u8 = 2;
++const SLOW_CLIENT_DEADLINE: Duration = Duration::from_secs(2);
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum TelemetryLifecycle { State(ProdGadgetState), Error }
++impl From<&ProdGadgetState> for TelemetryLifecycle { fn from(value: &ProdGadgetState) -> Self { Self::State(value.clone()) } }
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub struct TelemetrySnapshot {
++    pub schema_version: u8,
++    pub engine: &'static str,
++    pub lifecycle: &'static str,
++    pub wireless_listener_ready: bool,
++    pub wired_endpoint_ready: bool,
++    pub iphone_connected: bool,
++    pub vehicle_connected: bool,
++    pub bridge_active: bool,
++}
++
++impl TelemetrySnapshot {
++    pub fn initial() -> Self {
++        Self {
++            schema_version: 1,
++            engine: "catplay",
++            lifecycle: "initial",
++            wireless_listener_ready: false,
++            wired_endpoint_ready: false,
++            iphone_connected: false,
++            vehicle_connected: false,
++            bridge_active: false,
++        }
++    }
++
++    pub fn from_gadget_states(
++        lifecycle: TelemetryLifecycle,
++        tx: Option<&CarPlayUsbClientGadgetStatus>,
++        rx: Option<&CarPlayWirelessGadgetState>,
++    ) -> Self {
++        if matches!(&lifecycle, TelemetryLifecycle::Error) { return Self { schema_version: 1, engine: "catplay", lifecycle: lifecycle_name(lifecycle), wireless_listener_ready: false, wired_endpoint_ready: false, iphone_connected: false, vehicle_connected: false, bridge_active: false }; }
++
++        let wireless_listener_ready = matches!(
++            rx,
++            Some(CarPlayWirelessGadgetState::Inviting | CarPlayWirelessGadgetState::Receiving | CarPlayWirelessGadgetState::Passive)
++        );
++        let wired_endpoint_ready = matches!(
++            tx,
++            Some(
++                CarPlayUsbClientGadgetStatus::WaitingForUsbAccessory
++                    | CarPlayUsbClientGadgetStatus::WaitingForInvite
++                    | CarPlayUsbClientGadgetStatus::Invited { .. }
++                    | CarPlayUsbClientGadgetStatus::Connecting
++                    | CarPlayUsbClientGadgetStatus::TransmitterReadyForPickup
++                    | CarPlayUsbClientGadgetStatus::Transmitting
++            )
++        );
++        let iphone_connected = matches!(rx, Some(CarPlayWirelessGadgetState::Receiving));
++        let vehicle_connected = matches!(tx, Some(CarPlayUsbClientGadgetStatus::Transmitting));
++
++        Self {
++            schema_version: 1,
++            engine: "catplay",
++            lifecycle: lifecycle_name(lifecycle),
++            wireless_listener_ready,
++            wired_endpoint_ready,
++            iphone_connected,
++            vehicle_connected,
++            bridge_active: iphone_connected && vehicle_connected,
++        }
++    }
++}
++
++fn lifecycle_name(state: TelemetryLifecycle) -> &'static str {
++    match state {
++        TelemetryLifecycle::State(ProdGadgetState::Initial) => "initial",
++        TelemetryLifecycle::State(ProdGadgetState::WaitingForUdc) => "waiting_for_udc",
++        TelemetryLifecycle::State(ProdGadgetState::WaitingForUsbTransmitterGadget) => "waiting_for_usb_transmitter_gadget",
++        TelemetryLifecycle::State(ProdGadgetState::WaitingForWirelessCarPlayGadget) => "waiting_for_wireless_carplay_gadget",
++        TelemetryLifecycle::State(ProdGadgetState::WaitingForCar) => "waiting_for_car",
++        TelemetryLifecycle::State(ProdGadgetState::WaitingForIPhone) => "waiting_for_iphone",
++        TelemetryLifecycle::State(ProdGadgetState::Running) => "running",
++        TelemetryLifecycle::Error => "error",
++    }
++}
++
++struct TelemetryClient {
++    stream: UnixStream,
++    // A client never owns more than one complete line. A partial write is evicted
++    // rather than mixing an old prefix with a newer snapshot.
++    pending: Option<Vec<u8>>,
++    blocked_since: Option<Instant>,
++    would_block_retries: u8,
++}
++
++impl TelemetryClient {
++    fn replace_pending(&mut self, line: &[u8]) {
++        self.pending = Some(line.to_vec());
++    }
++
++    fn record_would_block(&mut self, now: Instant) -> bool {
++        let blocked_since = self.blocked_since.get_or_insert(now);
++        self.would_block_retries = self.would_block_retries.saturating_add(1);
++        self.would_block_retries >= MAX_WOULD_BLOCK_RETRIES
++            || now.saturating_duration_since(*blocked_since) >= SLOW_CLIENT_DEADLINE
++    }
++
++    fn clear_blocked(&mut self) {
++        self.blocked_since = None;
++        self.would_block_retries = 0;
++    }
++}
++
++pub struct TelemetryServer {
++    listener: StdUnixListener,
++    path: PathBuf,
++    dev: u64,
++    ino: u64,
++    clients: Vec<TelemetryClient>,
++    latest: Vec<u8>,
++    last_publish: Instant,
++}
++
++impl TelemetryServer {
++    pub fn bind_from_env() -> io::Result<Self> {
++        let path = std::env::var_os("CP_TELEMETRY_SOCKET")
++            .map(PathBuf::from)
++            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
++        Self::bind(&path)
++    }
++
++    pub fn bind(path: &Path) -> io::Result<Self> {
++        prepare_socket_path(path)?;
++        let listener = StdUnixListener::bind(path)?;
++        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++        listener.set_nonblocking(true)?;
++        let metadata = fs::symlink_metadata(path)?;
++        if !metadata.file_type().is_socket() {
++            return Err(io::Error::new(ErrorKind::Other, "telemetry bind did not create a socket"));
++        }
++        let latest = encode_line(&TelemetrySnapshot::initial())?;
++        Ok(Self {
++            listener,
++            path: path.to_owned(),
++            dev: metadata.dev(),
++            ino: metadata.ino(),
++            clients: Vec::with_capacity(MAX_CLIENTS),
++            latest,
++            last_publish: Instant::now(),
++        })
++    }
++
++    pub fn publish(&mut self, snapshot: &TelemetrySnapshot) -> io::Result<()> {
++        let line = encode_line(snapshot)?;
++        if line != self.latest || self.last_publish.elapsed() >= HEARTBEAT {
++            self.latest = line;
++            self.last_publish = Instant::now();
++            for client in &mut self.clients {
++                client.replace_pending(&self.latest);
++            }
++        }
++        self.service();
++        Ok(())
++    }
++
++    fn service(&mut self) {
++        for _ in 0..MAX_ACCEPT_ATTEMPTS_PER_SERVICE {
++            match self.listener.accept() {
++                Ok((stream, _)) if self.clients.len() < MAX_CLIENTS => {
++                    if stream.set_nonblocking(true).is_err() {
++                        continue;
++                    }
++                    let Ok(stream) = UnixStream::from_std(stream) else {
++                        continue;
++                    };
++                    self.clients.push(TelemetryClient {
++                        stream,
++                        pending: Some(self.latest.clone()),
++                        blocked_since: None,
++                        would_block_retries: 0,
++                    });
++                }
++                // Accept and immediately close excess peers so they cannot remain
++                // queued in the kernel while the four slots are occupied.
++                Ok((_stream, _)) => {}
++                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
++                Err(_) => break,
++            }
++        }
++
++        let mut index = 0;
++        while index < self.clients.len() {
++            let now = Instant::now();
++            let client = &mut self.clients[index];
++            let write = client
++                .pending
++                .as_ref()
++                .map(|line| (client.stream.try_write(line), line.len()));
++            let remove = match write {
++                None => false,
++                Some((Ok(0), _)) => true,
++                Some((Ok(written), line_len)) if written == line_len => {
++                    client.pending = None;
++                    client.clear_blocked();
++                    false
++                }
++                Some((Ok(_), _)) => true,
++                // A peer which never drains must not consume one of the four
++                // slots forever. The retry count bounds eviction even if the
++                // monotonic clock is not observed past the deadline yet.
++                Some((Err(err), _)) if err.kind() == ErrorKind::WouldBlock => {
++                    client.record_would_block(now)
++                }
++                Some((Err(_), _)) => true,
++            };
++            if remove {
++                self.clients.swap_remove(index);
++            } else {
++                index += 1;
++            }
++        }
++    }
++
++    #[cfg(test)]
++    fn client_count(&self) -> usize {
++        self.clients.len()
++    }
++}
++
++impl Drop for TelemetryServer {
++    fn drop(&mut self) {
++        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
++            return;
++        };
++        if metadata.file_type().is_socket() && metadata.dev() == self.dev && metadata.ino() == self.ino {
++            let _ = fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn prepare_socket_path(path: &Path) -> io::Result<()> {
++    let parent = path
++        .parent()
++        .filter(|parent| !parent.as_os_str().is_empty())
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "telemetry socket has no parent directory"))?;
++    let parent_metadata = fs::symlink_metadata(parent)?;
++    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
++        return Err(io::Error::new(
++            ErrorKind::PermissionDenied,
++            "telemetry socket parent must be an existing non-symlink directory",
++        ));
++    }
++
++    match fs::symlink_metadata(path) {
++        Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() } => fs::remove_file(path),
++        Ok(metadata) if metadata.file_type().is_socket() => Err(io::Error::new(
++            ErrorKind::PermissionDenied,
++            "refusing to remove telemetry socket owned by another uid",
++        )),
++        Ok(_) => Err(io::Error::new(
++            ErrorKind::AlreadyExists,
++            "refusing to replace non-socket telemetry path",
++        )),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
++        Err(err) => Err(err),
++    }
++}
++
++fn encode_line(snapshot: &TelemetrySnapshot) -> io::Result<Vec<u8>> {
++    let mut line = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
++    line.push(b'\n');
++    if line.len() > MAX_LINE {
++        return Err(io::Error::new(ErrorKind::InvalidData, "telemetry line exceeds 4096 bytes"));
++    }
++    Ok(line)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        fs,
++        os::unix::{
++            fs::{symlink, PermissionsExt},
++            net::UnixListener as StdUnixListener,
++        },
++        path::PathBuf,
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++
++    use super::*;
++
++    static NEXT_TEST_PATH: AtomicUsize = AtomicUsize::new(0);
++
++    fn test_path(name: &str) -> PathBuf {
++        let id = NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed);
++        std::env::temp_dir().join(format!("catplay-telemetry-{}-{}-{id}", std::process::id(), name))
++    }
++
++    fn cleanup(path: &Path) {
++        let _ = fs::remove_file(path);
++        let _ = fs::remove_dir(path);
++    }
++
++    #[test]
++    fn false_readiness_before_real_gadget_states() {
++        let snapshot = TelemetrySnapshot::from_gadget_states(TelemetryLifecycle::from(&ProdGadgetState::Initial), Some(&CarPlayUsbClientGadgetStatus::Initial), None);
++        assert_eq!(snapshot.lifecycle, "initial");
++        assert!(!snapshot.wireless_listener_ready);
++        assert!(!snapshot.wired_endpoint_ready);
++        assert!(!snapshot.iphone_connected);
++        assert!(!snapshot.vehicle_connected);
++        assert!(!snapshot.bridge_active);
++    }
++
++    #[test]
++    fn running_requires_real_tx_and_rx() {
++        let waiting = TelemetrySnapshot::from_gadget_states(
++            TelemetryLifecycle::from(&ProdGadgetState::Running),
++            Some(&CarPlayUsbClientGadgetStatus::WaitingForInvite),
++            Some(&CarPlayWirelessGadgetState::Receiving),
++        );
++        assert!(waiting.wireless_listener_ready);
++        assert!(waiting.iphone_connected);
++        assert!(!waiting.vehicle_connected);
++        assert!(!waiting.bridge_active);
++
++        let active = TelemetrySnapshot::from_gadget_states(
++            TelemetryLifecycle::from(&ProdGadgetState::Running),
++            Some(&CarPlayUsbClientGadgetStatus::Transmitting),
++            Some(&CarPlayWirelessGadgetState::Receiving),
++        );
++        assert!(active.bridge_active);
++    }
++
++    #[test]
++    fn json_is_versioned_line_delimited_and_bounded() {
++        let line = encode_line(&TelemetrySnapshot::initial()).unwrap();
++        assert!(line.ends_with(b"\n"));
++        assert!(line.len() <= MAX_LINE);
++        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
++        assert_eq!(value["schema_version"], 1);
++        assert_eq!(value["engine"], "catplay");
++        assert_eq!(value["lifecycle"], "initial");
++    }
++
++    #[test]
++    fn socket_is_0600_and_stale_owned_socket_is_replaced() {
++        let dir = test_path("mode");
++        fs::create_dir(&dir).unwrap();
++        let path = dir.join("catplay.sock");
++        drop(StdUnixListener::bind(&path).unwrap());
++        let server = TelemetryServer::bind(&path).unwrap();
++        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
++        drop(server);
++        assert!(!path.exists());
++        cleanup(&dir);
++    }
++
++    #[test]
++    fn symlink_parent_is_rejected() {
++        let dir = test_path("symlink-parent");
++        let target = test_path("symlink-target");
++        fs::create_dir(&dir).unwrap();
++        fs::create_dir(&target).unwrap();
++        let link = dir.join("link");
++        symlink(&target, &link).unwrap();
++        assert_eq!(
++            TelemetryServer::bind(&link.join("catplay.sock"))
++                .err()
++                .unwrap()
++                .kind(),
++            ErrorKind::PermissionDenied
++        );
++        cleanup(&link);
++        cleanup(&target);
++        cleanup(&dir);
++    }
++
++    #[test]
++    fn replacement_path_is_not_unlinked_on_drop() {
++        let dir = test_path("inode");
++        fs::create_dir(&dir).unwrap();
++        let path = dir.join("catplay.sock");
++        let server = TelemetryServer::bind(&path).unwrap();
++        fs::remove_file(&path).unwrap();
++        let replacement = StdUnixListener::bind(&path).unwrap();
++        drop(server);
++        assert!(path.exists());
++        drop(replacement);
++        cleanup(&path);
++        cleanup(&dir);
++    }
++
++    #[test]
++    fn non_socket_is_never_replaced() {
++        let dir = test_path("file");
++        fs::create_dir(&dir).unwrap();
++        let path = dir.join("catplay.sock");
++        fs::write(&path, b"do not replace").unwrap();
++        assert_eq!(TelemetryServer::bind(&path).err().unwrap().kind(), ErrorKind::AlreadyExists);
++        assert_eq!(fs::read(&path).unwrap(), b"do not replace");
++        cleanup(&path);
++        cleanup(&dir);
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn would_block_client_is_evicted_after_two_retries() {
++        let dir = test_path("would-block");
++        fs::create_dir(&dir).unwrap();
++        let path = dir.join("catplay.sock");
++        let mut server = TelemetryServer::bind(&path).unwrap();
++        let (stream, _peer) = UnixStream::pair().unwrap();
++        let client = TelemetryClient {
++            stream,
++            pending: Some(server.latest.clone()),
++            blocked_since: None,
++            would_block_retries: 0,
++        };
++        let filler = [0; MAX_LINE];
++        for _ in 0..1024 {
++            match client.stream.try_write(&filler) {
++                Ok(_) => continue,
++                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
++                Err(err) => panic!("failed to fill test socket: {err}"),
++            }
++        }
++        assert!(matches!(client.stream.try_write(&filler), Err(err) if err.kind() == ErrorKind::WouldBlock));
++        server.clients.push(client);
++        server.service();
++        assert_eq!(server.client_count(), 1);
++        server.service();
++        assert_eq!(server.client_count(), 0);
++        drop(server);
++        cleanup(&dir);
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn client_cap_and_slow_client_keep_only_latest_unwritten_line() {
++        let dir = test_path("clients");
++        fs::create_dir(&dir).unwrap();
++        let path = dir.join("catplay.sock");
++        let mut server = TelemetryServer::bind(&path).unwrap();
++        let mut peers = Vec::new();
++        for _ in 0..MAX_CLIENTS + 1 {
++            peers.push(UnixStream::connect(&path).await.unwrap());
++        }
++        server.service();
++        assert_eq!(server.client_count(), MAX_CLIENTS);
++        tokio::time::timeout(Duration::from_secs(1), peers[MAX_CLIENTS].readable())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(peers[MAX_CLIENTS].try_read(&mut [0]).unwrap(), 0);
++
++        let (stream, _peer) = UnixStream::pair().unwrap();
++        let mut slow = TelemetryClient {
++            stream,
++            pending: Some(b"old\n".to_vec()),
++            blocked_since: None,
++            would_block_retries: 0,
++        };
++        slow.replace_pending(b"new\n");
++        assert_eq!(slow.pending.as_deref(), Some(&b"new\n"[..]));
++        let now = Instant::now();
++        assert!(!slow.record_would_block(now));
++        assert!(slow.record_would_block(now));
++        drop(peers);
++        drop(server);
++        cleanup(&dir);
++    }
++}
+diff --git a/c2a/catplay_fb/Cargo.toml b/c2a/catplay_fb/Cargo.toml
+index eb27615..c9164f6 100644
+--- a/c2a/catplay_fb/Cargo.toml
++++ b/c2a/catplay_fb/Cargo.toml
+@@ -22,7 +22,7 @@ x264-sys = { version = "0.2.3", optional = true }
+ openh264 = { version = "0.9.3", optional = true }
+ openh264-sys2 = { version = "0.9.3", optional = true }
+ turbojpeg = { version = "1.4.0", default-features = false, features = [
+-    "pkg-config",
++    "cmake",
+ ] }
+ 
+ [features]
+diff --git a/carplay/catplay_carplay/src/events/events_client.rs b/carplay/catplay_carplay/src/events/events_client.rs
+index a005f49..df10583 100644
+--- a/carplay/catplay_carplay/src/events/events_client.rs
++++ b/carplay/catplay_carplay/src/events/events_client.rs
+@@ -72,7 +72,7 @@ impl TcpSession for EventsClient {
+ 
+     fn init_stream(&mut self, stream: &mut TcpStream) -> Result<(), Self::Error> {
+         stream.set_nodelay(true)?;
+-        std::os::linux::net::TcpStreamExt::set_quickack(stream, true)?;
++        crate::set_tcp_quickack(stream)?;
+ 
+         Ok(())
+     }
+diff --git a/carplay/catplay_carplay/src/events/events_server.rs b/carplay/catplay_carplay/src/events/events_server.rs
+index b98f06c..62f3393 100644
+--- a/carplay/catplay_carplay/src/events/events_server.rs
++++ b/carplay/catplay_carplay/src/events/events_server.rs
+@@ -134,7 +134,7 @@ impl<T: EventServerCallback> TcpSession for EventsServer<T> {
+ 
+     fn init_stream(&mut self, stream: &mut TcpStream) -> Result<(), Self::Error> {
+         stream.set_nodelay(true)?;
+-        std::os::linux::net::TcpStreamExt::set_quickack(stream, true)?;
++        crate::set_tcp_quickack(stream)?;
+ 
+         Ok(())
+     }
+diff --git a/carplay/catplay_carplay/src/lib.rs b/carplay/catplay_carplay/src/lib.rs
+index c252b6e..407d14a 100644
+--- a/carplay/catplay_carplay/src/lib.rs
++++ b/carplay/catplay_carplay/src/lib.rs
+@@ -18,3 +18,19 @@ pub mod video;
+ pub mod carplay_rx;
+ #[cfg(feature = "tx")]
+ pub mod carplay_tx;
++
++pub(crate) fn set_tcp_quickack(stream: &std::net::TcpStream) -> std::io::Result<()> {
++    use std::os::fd::AsRawFd;
++
++    let value: libc::c_int = 1;
++    let result = unsafe {
++        libc::setsockopt(
++            stream.as_raw_fd(),
++            libc::IPPROTO_TCP,
++            libc::TCP_QUICKACK,
++            (&value as *const libc::c_int).cast(),
++            std::mem::size_of_val(&value) as libc::socklen_t,
++        )
++    };
++    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
++}
+diff --git a/carplay/catplay_carplay/src/rtsp_session/rtsp_receiver.rs b/carplay/catplay_carplay/src/rtsp_session/rtsp_receiver.rs
+index 2bfd71c..cd8db13 100644
+--- a/carplay/catplay_carplay/src/rtsp_session/rtsp_receiver.rs
++++ b/carplay/catplay_carplay/src/rtsp_session/rtsp_receiver.rs
+@@ -123,7 +123,7 @@ impl<T: RtspReceiverCallback> TcpSession for RtspReceiver<T> {
+ 
+     fn init_stream(&mut self, stream: &mut TcpStream) -> Result<(), Self::Error> {
+         stream.set_nodelay(true)?;
+-        std::os::linux::net::TcpStreamExt::set_quickack(stream, true)?;
++        crate::set_tcp_quickack(stream)?;
+ 
+         Ok(())
+     }
+diff --git a/carplay/catplay_carplay/src/rtsp_session/rtsp_transmitter.rs b/carplay/catplay_carplay/src/rtsp_session/rtsp_transmitter.rs
+index 6201579..b5552a7 100644
+--- a/carplay/catplay_carplay/src/rtsp_session/rtsp_transmitter.rs
++++ b/carplay/catplay_carplay/src/rtsp_session/rtsp_transmitter.rs
+@@ -105,7 +105,7 @@ impl<T: RtspTransmitterCallback> TcpSession for RtspTransmitter<T> {
+ 
+     fn init_stream(&mut self, stream: &mut TcpStream) -> Result<(), Self::Error> {
+         stream.set_nodelay(true)?;
+-        std::os::linux::net::TcpStreamExt::set_quickack(stream, true)?;
++        crate::set_tcp_quickack(stream)?;
+ 
+         Ok(())
+     }
+diff --git a/core/catplay_hap/build.rs b/core/catplay_hap/build.rs
+index 71c5d3e..730c826 100644
+--- a/core/catplay_hap/build.rs
++++ b/core/catplay_hap/build.rs
+@@ -16,6 +16,11 @@ fn main() {
+     let os = env::var("CARGO_CFG_TARGET_OS").unwrap(); // e.g. "macos"
+     let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+ 
++    if env::var_os("CATPLAY_HAP_FORCE_SOFT_CHACHA").is_some() {
++        println!("cargo:warning=fast_chacha: forced Rust fallback");
++        return;
++    }
++
+     // Prepare OUT_DIR for generated headers and patched .S
+     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+ 
+diff --git a/core/catplay_hap/src/backend/pair_setup.rs b/core/catplay_hap/src/backend/pair_setup.rs
+index ce8564a..f2f1c23 100644
+--- a/core/catplay_hap/src/backend/pair_setup.rs
++++ b/core/catplay_hap/src/backend/pair_setup.rs
+@@ -250,7 +250,7 @@ impl<'a> PairSetupCache<'a> {
+             salt,
+             b,
+             pin,
+-            verifier: [0u8; _],
++            verifier: [0u8; 384],
+             verifier_len: 384,
+             computed_verifier: false,
+             b_pub: [0u8; 384],
+diff --git a/core/catplay_tracing/src/logger.rs b/core/catplay_tracing/src/logger.rs
+index c6b008f..db5aede 100644
+--- a/core/catplay_tracing/src/logger.rs
++++ b/core/catplay_tracing/src/logger.rs
+@@ -347,17 +347,7 @@ pub fn enqueue_async_log_for_logger(
+ }
+ 
+ fn log_owned_message_via_log_crate(record: OwnedLogRecord) {
+-    let args = format_args!("{}", record.message);
+-    let log_record = Record::builder()
+-        .args(args)
+-        .level(record.level)
+-        .target(record.target)
+-        .module_path_static(Some(record.module_path))
+-        .file_static(Some(record.file))
+-        .line(Some(record.line))
+-        .build();
+-
+-    log::logger().log(&log_record);
++    log::logger().log(&Record::builder().args(format_args!("{}", record.message)).level(record.level).target(record.target).module_path_static(Some(record.module_path)).file_static(Some(record.file)).line(Some(record.line)).build());
+ }
+ 
+ impl Log for AsyncLogger {
+@@ -398,20 +388,7 @@ impl LoggerShared {
+     }
+ 
+     fn log_owned_message(&self, record: OwnedLogRecord) {
+-        let args = format_args!("{}", record.message);
+-        let log_record = Record::builder()
+-            .args(args)
+-            .level(record.level)
+-            .target(record.target)
+-            .module_path_static(Some(record.module_path))
+-            .file_static(Some(record.file))
+-            .line(Some(record.line))
+-            .build();
+-
+-        self.log_timestamped(&TimestampedRecord {
+-            record: &log_record,
+-            created_at: record.created_at,
+-        });
++        self.log_timestamped(&TimestampedRecord { record: &Record::builder().args(format_args!("{}", record.message)).level(record.level).target(record.target).module_path_static(Some(record.module_path)).file_static(Some(record.file)).line(Some(record.line)).build(), created_at: record.created_at });
+     }
+ 
+     fn log_timestamped(&self, record: &TimestampedRecord<'_>) {
